@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+compile_commands.json
+*.o
+*.a
+*.so
+
+# Old single-file build
+monitor.cpp
+monitor
+
+# Runtime output
+events.log
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
