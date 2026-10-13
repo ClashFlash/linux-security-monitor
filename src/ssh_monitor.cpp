@@ -2,6 +2,7 @@
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <set>
 #include <chrono>
 #include <thread>
 #include <filesystem>
@@ -91,7 +92,18 @@ void SshMonitor::start() {
 
 void SshMonitor::stop() {
     running_ = false;
+    cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+}
+
+std::vector<AuthEvent> SshMonitor::recent_events() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return events_;
+}
+
+std::map<std::string, IpStats> SshMonitor::ip_stats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ip_stats_;
 }
 
 std::string SshMonitor::find_auth_log() {
@@ -198,21 +210,55 @@ void SshMonitor::tail_loop() {
                 // Reset eof so we keep reading
                 f.clear();
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::unique_lock<std::mutex> lock(cv_mutex_);
+            cv_.wait_for(lock, std::chrono::seconds(1), [this] { return !running_.load(); });
         }
     } else {
         // Fallback: poll journalctl
-        while (running_) {
+        // Seed seen_lines with current 50 lines so past logins/failures don't trigger alerts
+        std::set<std::string> seen_lines;
+        {
             FILE* pipe = popen(
                 "journalctl -u ssh -u sshd -n 50 --no-pager --output=short 2>/dev/null",
                 "r");
             if (pipe) {
                 char buf[512];
                 while (fgets(buf, sizeof(buf), pipe))
-                    process_line(std::string(buf));
+                    seen_lines.insert(std::string(buf));
                 pclose(pipe);
             }
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+
+        while (running_) {
+            {
+                std::unique_lock<std::mutex> lock(cv_mutex_);
+                if (cv_.wait_for(lock, std::chrono::seconds(5), [this] { return !running_.load(); }))
+                    break;
+            }
+
+            FILE* pipe = popen(
+                "journalctl -u ssh -u sshd -n 50 --no-pager --output=short 2>/dev/null",
+                "r");
+            if (pipe) {
+                char buf[512];
+                std::vector<std::string> new_lines;
+                while (fgets(buf, sizeof(buf), pipe)) {
+                    std::string s(buf);
+                    if (seen_lines.find(s) == seen_lines.end()) {
+                        seen_lines.insert(s);
+                        new_lines.push_back(s);
+                    }
+                }
+                pclose(pipe);
+
+                if (seen_lines.size() > 500) {
+                    seen_lines.clear();
+                    for (const auto& nl : new_lines) seen_lines.insert(nl);
+                }
+
+                for (const auto& nl : new_lines)
+                    process_line(nl);
+            }
         }
     }
 }

@@ -64,6 +64,7 @@ public:
 
 private:
     mutable std::mutex     mutex_;
+    mutable std::mutex     cb_mutex_;
     std::deque<Event>      ring_;
     std::vector<Callback>  callbacks_;
     std::filesystem::path  log_path_;

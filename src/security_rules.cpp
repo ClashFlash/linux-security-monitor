@@ -138,9 +138,9 @@ void SecurityEngine::evaluate(const std::vector<proc::ProcessInfo>&  procs,
         auto fire = [&](RuleResult r) {
             if (!r.triggered) return;
             // De-duplicate per (pid, rule)
-            auto key = p.pid * 1000 + std::hash<std::string>{}(r.rule_name) % 1000;
-            if (alerted_pids_.count(static_cast<int>(key))) return;
-            alerted_pids_.insert(static_cast<int>(key));
+            auto key = std::make_pair(p.pid, r.rule_name);
+            if (alerted_rules_.count(key)) return;
+            alerted_rules_.insert(key);
 
             log_->push({
                 std::chrono::system_clock::now(),

@@ -29,7 +29,8 @@ namespace ui {
 #define ANSI_BYELLOW "\033[93m"
 #define ANSI_BBLUE   "\033[94m"
 #define ANSI_BCYAN   "\033[96m"
-#define ANSI_BG_DARK "\033[48;5;235m"
+#define ANSI_CLEAR_LINE "\033[K"
+#define ANSI_CLEAR_DOWN "\033[J"
 
 static struct termios saved_termios;
 
@@ -112,8 +113,6 @@ int Terminal::get_key() {
 // Key constants
 constexpr int KEY_UP    = 1000;
 constexpr int KEY_DOWN  = 1001;
-constexpr int KEY_RIGHT = 1002;
-constexpr int KEY_LEFT  = 1003;
 constexpr int KEY_PGUP  = 1004;
 constexpr int KEY_PGDN  = 1005;
 constexpr int KEY_ENTER = 13;
@@ -125,6 +124,7 @@ bool Terminal::handle_key(UiState& state, int key,
                            const std::vector<const proc::ProcessInfo*>& procs,
                            proc::ProcessMonitor& pm)
 {
+    (void)pm;
     if (key == -1) return true;
 
     // Global keys
@@ -139,18 +139,18 @@ bool Terminal::handle_key(UiState& state, int key,
         if (key == '2') { state.active_panel = Panel::NETWORK;   return true; }
         if (key == '3') { state.active_panel = Panel::EVENTS;    return true; }
         if (key == '4') { state.active_panel = Panel::HELP;      return true; }
-        if (key == 'h') { state.active_panel = Panel::HELP;      return true; }
+        if (key == 'h' || key == 'H') { state.active_panel = Panel::HELP; return true; }
     }
 
     if (state.active_panel == Panel::PROCESSES) {
         if (state.proc_detail) {
-            if (key == KEY_ESC || key == 'q') { state.proc_detail = false; return true; }
+            if (key == KEY_ESC || key == 'q' || key == 'Q') { state.proc_detail = false; return true; }
             return true;
         }
         if (state.proc_searching) {
             if (key == KEY_ENTER || key == KEY_ESC) {
                 state.proc_searching = false;
-            } else if (key == KEY_BS && !state.proc_search.empty()) {
+            } else if ((key == KEY_BS || key == 8 || key == 127) && !state.proc_search.empty()) {
                 state.proc_search.pop_back();
             } else if (key >= 32 && key < 127) {
                 state.proc_search += static_cast<char>(key);
@@ -159,14 +159,14 @@ bool Terminal::handle_key(UiState& state, int key,
             return true;
         }
         if (key == '/') { state.proc_searching = true; state.proc_search.clear(); return true; }
-        if (key == 'c') { state.proc_sort = proc::SortField::CPU; return true; }
-        if (key == 'm') { state.proc_sort = proc::SortField::MEM; return true; }
-        if (key == 'p') { state.proc_sort = proc::SortField::PID; return true; }
-        if (key == KEY_UP   && state.proc_selected > 0)
+        if (key == 'c' || key == 'C') { state.proc_sort = proc::SortField::CPU; return true; }
+        if (key == 'm' || key == 'M') { state.proc_sort = proc::SortField::MEM; return true; }
+        if (key == 'p' || key == 'P') { state.proc_sort = proc::SortField::PID; return true; }
+        if (key == KEY_UP && state.proc_selected > 0)
             state.proc_selected--;
-        if (key == KEY_DOWN && state.proc_selected < (int)procs.size() - 1)
+        if (key == KEY_DOWN && state.proc_selected < static_cast<int>(procs.size()) - 1)
             state.proc_selected++;
-        if (key == KEY_ENTER && !procs.empty() && state.proc_selected < (int)procs.size()) {
+        if (key == KEY_ENTER && !procs.empty() && state.proc_selected < static_cast<int>(procs.size())) {
             state.proc_detail = true;
         }
     }
@@ -174,26 +174,26 @@ bool Terminal::handle_key(UiState& state, int key,
     if (state.active_panel == Panel::EVENTS) {
         if (state.event_searching) {
             if (key == KEY_ENTER || key == KEY_ESC) { state.event_searching = false; }
-            else if (key == KEY_BS && !state.event_search.empty()) { state.event_search.pop_back(); }
+            else if ((key == KEY_BS || key == 8 || key == 127) && !state.event_search.empty()) { state.event_search.pop_back(); }
             else if (key >= 32 && key < 127) { state.event_search += static_cast<char>(key); }
             state.event_scroll = 0;
             return true;
         }
         if (key == '/') { state.event_searching = true; state.event_search.clear(); return true; }
-        if (key == 'f') {
+        if (key == 'f' || key == 'F') {
             state.event_filter = static_cast<EventFilter>(
                 (static_cast<int>(state.event_filter) + 1) % 6);
             state.event_scroll = 0;
             return true;
         }
-        if (key == KEY_UP   && state.event_scroll > 0) state.event_scroll--;
+        if (key == KEY_UP && state.event_scroll > 0) state.event_scroll--;
         if (key == KEY_DOWN) state.event_scroll++;
-        if (key == KEY_PGUP && state.event_scroll > 10) state.event_scroll -= 10;
+        if (key == KEY_PGUP) state.event_scroll = std::max(0, state.event_scroll - 10);
         if (key == KEY_PGDN) state.event_scroll += 10;
     }
 
     if (state.active_panel == Panel::NETWORK) {
-        if (key == KEY_UP   && state.net_scroll > 0) state.net_scroll--;
+        if (key == KEY_UP && state.net_scroll > 0) state.net_scroll--;
         if (key == KEY_DOWN) state.net_scroll++;
     }
 
@@ -216,7 +216,7 @@ void Terminal::draw(const DisplayData& d, const UiState& state) {
     switch (state.active_panel) {
         case Panel::PROCESSES:
             if (state.proc_detail && !d.sorted_procs.empty() &&
-                state.proc_selected < (int)d.sorted_procs.size())
+                state.proc_selected < static_cast<int>(d.sorted_procs.size()))
                 draw_process_detail(*d.sorted_procs[state.proc_selected], rows, cols);
             else
                 draw_processes(d, state, top_row, body_rows, cols);
@@ -237,12 +237,15 @@ void Terminal::draw(const DisplayData& d, const UiState& state) {
 }
 
 void Terminal::draw_header(const cpu::CpuMonitor& cpu,
-                            const mem::MemoryMonitor& mem, int cols)
+                           const mem::MemoryMonitor& mem, int cols)
 {
     // Current time
     time_t now = time(nullptr);
-    char timebuf[32];
-    strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    char timebuf[32] = {};
+    struct tm tm_info{};
+    if (localtime_r(&now, &tm_info)) {
+        strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", &tm_info);
+    }
 
     // CPU bar
     float cpu_pct = cpu.overall_pct();
@@ -250,39 +253,48 @@ void Terminal::draw_header(const cpu::CpuMonitor& cpu,
     std::string cpu_bar = progress_bar(cpu_pct, 20);
 
     // RAM
-    const auto& mi = mem.info();
+    const auto mi = mem.info();
     float mem_pct = mi.used_pct();
     std::string mem_color = mem_pct > 80 ? ANSI_BRED : mem_pct > 60 ? ANSI_BYELLOW : ANSI_BGREEN;
     std::string mem_bar = progress_bar(mem_pct, 20);
     std::string mem_str = std::to_string(mi.used_mb()) + " / " + std::to_string(mi.total_mb()) + " MB";
 
     set_cursor(1, 1);
-    printf(ANSI_BOLD ANSI_BCYAN " Linux Security Monitor" ANSI_RESET);
+    printf(ANSI_BOLD ANSI_BCYAN " Linux Security Monitor" ANSI_RESET "%s", ANSI_CLEAR_LINE);
     // Right-align timestamp
-    int ts_col = cols - static_cast<int>(strlen(timebuf)) - 1;
-    set_cursor(1, ts_col);
-    printf(ANSI_DIM "%s" ANSI_RESET, timebuf);
+    int ts_len = static_cast<int>(strlen(timebuf));
+    if (cols > ts_len + 30) {
+        set_cursor(1, cols - ts_len);
+        printf(ANSI_DIM "%s" ANSI_RESET, timebuf);
+    }
 
     set_cursor(2, 1);
     printf(" CPU " ANSI_BOLD "%s%s%3.0f%%" ANSI_RESET
-           "  RAM " ANSI_BOLD "%s%s%3.0f%%" ANSI_RESET "  %s",
+           "  RAM " ANSI_BOLD "%s%s%3.0f%%" ANSI_RESET "  %s%s",
            cpu_color.c_str(), cpu_bar.c_str(), cpu_pct,
            mem_color.c_str(), mem_bar.c_str(), mem_pct,
-           mem_str.c_str());
+           mem_str.c_str(), ANSI_CLEAR_LINE);
 
     // Per-core mini bars if space
-    const auto& cores = cpu.cores();
+    const auto cores = cpu.cores();
     if (!cores.empty() && cols > 100) {
-        set_cursor(2, cols - static_cast<int>(cores.size()) * 7 - 1);
-        for (const auto& c : cores) {
-            const char* col = c.usage_pct > 80 ? ANSI_RED : c.usage_pct > 50 ? ANSI_YELLOW : ANSI_GREEN;
-            printf("%s%3.0f%%" ANSI_RESET " ", col, c.usage_pct);
+        int avail_cols = cols - 65;
+        int max_cores = avail_cols / 7;
+        if (max_cores > 0) {
+            int display_count = std::min(static_cast<int>(cores.size()), max_cores);
+            set_cursor(2, cols - display_count * 7);
+            for (int i = 0; i < display_count; ++i) {
+                const auto& c = cores[i];
+                const char* col = c.usage_pct > 80 ? ANSI_RED : c.usage_pct > 50 ? ANSI_YELLOW : ANSI_GREEN;
+                printf("%s%3.0f%%" ANSI_RESET " ", col, c.usage_pct);
+            }
         }
     }
     printf("\n");
 }
 
 void Terminal::draw_tab_bar(const UiState& state, int cols) {
+    (void)cols;
     set_cursor(4, 1);
     struct Tab { Panel p; const char* label; };
     Tab tabs[] = {
@@ -297,124 +309,146 @@ void Terminal::draw_tab_bar(const UiState& state, int cols) {
         else
             printf(ANSI_DIM "%s" ANSI_RESET, t.label);
     }
-    printf("\n");
+    printf("%s\n", ANSI_CLEAR_LINE);
 }
 
 // Helper: truncate string to width
 static std::string trunc(const std::string& s, int w) {
     if (w <= 0) return "";
-    if ((int)s.size() <= w) return s + std::string(w - s.size(), ' ');
-    return s.substr(0, w - 1) + "…";
+    if (static_cast<int>(s.size()) <= w) return s;
+    if (w <= 3) return s.substr(0, w);
+    return s.substr(0, w - 3) + "...";
 }
 
 void Terminal::draw_processes(const DisplayData& d, const UiState& state,
                                int top_row, int rows, int cols)
 {
-    auto& sorted = const_cast<std::vector<const proc::ProcessInfo*>&>(d.sorted_procs);
+    const auto& sorted = d.sorted_procs;
+
+    int exe_col_width = std::max(10, cols - 65);
 
     // Header
     set_cursor(top_row, 1);
     printf(ANSI_BOLD ANSI_BCYAN
-           "%-7s %-7s %-10s %-6s %-6s %-2s %-20s %-*s %s" ANSI_RESET "\n",
+           "%-7s %-7s %-10s %-6s %-6s %-2s %-20s %-*s %s" ANSI_RESET "%s\n",
            "PID", "PPID", "USER", "CPU%", "MEM%", "S",
-           "COMMAND", cols - 64, "EXE PATH", "STARTED");
+           "COMMAND", exe_col_width, "EXE PATH", "STARTED", ANSI_CLEAR_LINE);
 
     // Search bar
     if (state.proc_searching || !state.proc_search.empty()) {
         set_cursor(top_row + 1, 1);
-        printf(ANSI_YELLOW " Search: %s_" ANSI_RESET "\n", state.proc_search.c_str());
+        printf(ANSI_YELLOW " Search: %s_" ANSI_RESET "%s\n", state.proc_search.c_str(), ANSI_CLEAR_LINE);
     }
 
     int row_offset = state.proc_searching ? 2 : 1;
-    int visible = rows - row_offset - 1;
+    int visible = std::max(0, rows - row_offset);
 
     // Scroll so selected is visible
     int scroll = std::max(0, state.proc_selected - visible + 3);
 
-    for (int i = 0; i < visible && (i + scroll) < (int)sorted.size(); i++) {
+    int drawn_count = 0;
+    for (int i = 0; i < visible && (i + scroll) < static_cast<int>(sorted.size()); i++) {
         const auto* p = sorted[i + scroll];
         bool selected = (i + scroll) == state.proc_selected;
 
         // State color
         const char* state_col =
             (p->state == proc::ProcState::Running)  ? ANSI_BGREEN :
-            (p->state == proc::ProcState::Waiting)   ? ANSI_BYELLOW :
-            (p->state == proc::ProcState::Zombie)    ? ANSI_BRED : ANSI_RESET;
+            (p->state == proc::ProcState::Waiting)  ? ANSI_BYELLOW :
+            (p->state == proc::ProcState::Zombie)   ? ANSI_BRED : ANSI_RESET;
 
         // Anomaly highlight
         const char* row_col = ANSI_RESET;
         if (p->root_from_suspicious) row_col = ANSI_BRED;
         else if (p->from_tmp || p->exe_deleted) row_col = ANSI_BYELLOW;
 
+        set_cursor(top_row + row_offset + i, 1);
         if (selected) printf(ANSI_REVERSE);
         printf("%s", row_col);
 
         char state_c = static_cast<char>(p->state);
-        printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %s%c%s %-20s %-*s %s\n",
+        std::string short_exe = p->exe_path.size() > 40
+            ? p->exe_path.substr(p->exe_path.size() - 38)
+            : p->exe_path;
+
+        printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %s%c%s %-20s %-*s %s",
                p->pid, p->ppid,
                trunc(p->username, 10).c_str(),
                p->cpu_pct, p->mem_pct,
                state_col, state_c, ANSI_RESET,
                trunc(p->name, 20).c_str(),
-               cols - 65, trunc(p->exe_path.size() > 40 ? p->exe_path.substr(p->exe_path.size()-38) : p->exe_path, cols - 65).c_str(),
+               exe_col_width, trunc(short_exe, exe_col_width).c_str(),
                p->start_time_str.c_str());
-        printf(ANSI_RESET);
+        printf(ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+        drawn_count++;
+    }
+
+    // Clear any extra rows in body
+    for (int i = drawn_count; i < visible; ++i) {
+        set_cursor(top_row + row_offset + i, 1);
+        printf("%s\n", ANSI_CLEAR_LINE);
     }
 
     // Sort indicator
-    set_cursor(top_row, cols - 20);
-    const char* sort_lbl = state.proc_sort == proc::SortField::CPU ? "Sort:CPU" :
-                           state.proc_sort == proc::SortField::MEM ? "Sort:MEM" : "Sort:PID";
-    printf(ANSI_DIM "%s" ANSI_RESET, sort_lbl);
+    if (cols > 30) {
+        set_cursor(top_row, cols - 15);
+        const char* sort_lbl = state.proc_sort == proc::SortField::CPU ? "Sort:CPU" :
+                               state.proc_sort == proc::SortField::MEM ? "Sort:MEM" : "Sort:PID";
+        printf(ANSI_DIM "%s" ANSI_RESET, sort_lbl);
+    }
 }
 
 void Terminal::draw_process_detail(const proc::ProcessInfo& p, int rows, int cols) {
+    (void)rows;
     set_cursor(5, 1);
-    printf(ANSI_BOLD ANSI_BCYAN " ── Process Detail ──────────────────────" ANSI_RESET "\n");
+    printf(ANSI_BOLD ANSI_BCYAN " ── Process Detail ──────────────────────" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
     auto line = [&](const char* lbl, const std::string& val) {
-        printf(ANSI_BOLD " %-16s" ANSI_RESET " %s\n", lbl, val.c_str());
+        printf(ANSI_BOLD " %-16s" ANSI_RESET " %s%s\n", lbl, val.c_str(), ANSI_CLEAR_LINE);
     };
     line("PID:",       std::to_string(p.pid));
     line("PPID:",      std::to_string(p.ppid));
     line("User:",      p.username + " (uid=" + std::to_string(p.uid) + ")");
     line("State:",     std::string(1, static_cast<char>(p.state)));
-    line("CPU%:",      std::to_string(p.cpu_pct).substr(0,5) + "%");
-    line("Memory%:",   std::to_string(p.mem_pct).substr(0,5) + "% (" + std::to_string(p.rss_kb/1024) + " MB)");
+    line("CPU%:",      std::to_string(p.cpu_pct).substr(0, 5) + "%");
+    line("Memory%:",   std::to_string(p.mem_pct).substr(0, 5) + "% (" + std::to_string(p.rss_kb / 1024) + " MB)");
     line("Name:",      p.name);
-    line("Cmdline:",   p.cmdline.substr(0, cols - 20));
+    int cmd_width = std::max(10, cols - 20);
+    line("Cmdline:",   trunc(p.cmdline, cmd_width));
     line("Exe:",       p.exe_path);
     line("Started:",   p.start_time_str);
     line("Open FDs:",  std::to_string(p.fd_count));
-    if (p.exe_deleted)          printf(ANSI_BRED " ⚠ Executable deleted\n" ANSI_RESET);
-    if (p.from_tmp)             printf(ANSI_BYELLOW " ⚠ Running from temp directory\n" ANSI_RESET);
-    if (p.root_from_suspicious) printf(ANSI_BRED " ⚠ Root process from suspicious path\n" ANSI_RESET);
-    printf(ANSI_DIM "\n Press ESC to return\n" ANSI_RESET);
+    if (p.exe_deleted)          printf(ANSI_BRED " ⚠ Executable deleted" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    if (p.from_tmp)             printf(ANSI_BYELLOW " ⚠ Running from temp directory" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    if (p.root_from_suspicious) printf(ANSI_BRED " ⚠ Root process from suspicious path" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    printf(ANSI_DIM "\n Press ESC to return" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    printf("%s", ANSI_CLEAR_DOWN);
 }
 
 void Terminal::draw_network(const DisplayData& d, const UiState& state,
                              int top_row, int rows, int cols)
 {
+    (void)cols;
     set_cursor(top_row, 1);
-    printf(ANSI_BOLD ANSI_BCYAN " ── Network Interfaces ──────────────────" ANSI_RESET "\n");
-    printf(ANSI_BOLD "%-12s %10s %10s %12s %12s %8s %8s" ANSI_RESET "\n",
-           "INTERFACE", "RX/s", "TX/s", "RX bytes", "TX bytes", "RX err", "TX err");
+    printf(ANSI_BOLD ANSI_BCYAN " ── Network Interfaces ──────────────────" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    printf(ANSI_BOLD "%-12s %10s %10s %12s %12s %8s %8s" ANSI_RESET "%s\n",
+           "INTERFACE", "RX/s", "TX/s", "RX bytes", "TX bytes", "RX err", "TX err", ANSI_CLEAR_LINE);
 
     for (const auto& iface : d.net->interfaces()) {
         auto fmt_rate = [](double r) -> std::string {
-            if (r > 1e6) return std::to_string((int)(r/1e6)) + " MB/s";
-            if (r > 1e3) return std::to_string((int)(r/1e3)) + " KB/s";
-            return std::to_string((int)r) + " B/s";
+            if (r > 1e6) return std::to_string(static_cast<int>(r / 1e6)) + " MB/s";
+            if (r > 1e3) return std::to_string(static_cast<int>(r / 1e3)) + " KB/s";
+            return std::to_string(static_cast<int>(r)) + " B/s";
         };
-        printf("%-12s %10s %10s %12lu %12lu %8lu %8lu\n",
+        printf("%-12s %10s %10s %12lu %12lu %8lu %8lu%s\n",
                iface.name.c_str(),
                fmt_rate(iface.rx_rate).c_str(), fmt_rate(iface.tx_rate).c_str(),
                iface.rx_bytes, iface.tx_bytes,
-               iface.rx_errors, iface.tx_errors);
+               iface.rx_errors, iface.tx_errors, ANSI_CLEAR_LINE);
     }
 
-    printf("\n" ANSI_BOLD ANSI_BCYAN " ── Connections ─────────────────────────" ANSI_RESET "\n");
-    printf(ANSI_BOLD "%-6s %-22s %-22s %-12s %-6s %-15s" ANSI_RESET "\n",
-           "PROTO", "LOCAL", "REMOTE", "STATE", "PID", "PROCESS");
+    printf("\n" ANSI_BOLD ANSI_BCYAN " ── Connections ─────────────────────────" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    printf(ANSI_BOLD "%-6s %-22s %-22s %-12s %-6s %-15s" ANSI_RESET "%s\n",
+           "PROTO", "LOCAL", "REMOTE", "STATE", "PID", "PROCESS", ANSI_CLEAR_LINE);
 
     int line = 0;
     int skip = state.net_scroll;
@@ -424,17 +458,18 @@ void Terminal::draw_network(const DisplayData& d, const UiState& state,
 
         const char* state_col =
             c.state == net::ConnState::ESTABLISHED ? ANSI_GREEN :
-            c.state == net::ConnState::LISTEN       ? ANSI_CYAN  :
-            c.state == net::ConnState::TIME_WAIT    ? ANSI_YELLOW: ANSI_RESET;
+            c.state == net::ConnState::LISTEN      ? ANSI_CYAN  :
+            c.state == net::ConnState::TIME_WAIT   ? ANSI_YELLOW : ANSI_RESET;
 
-        printf("%s%-6s%s %-22s %-22s %s%-12s%s %-6d %-15s\n",
+        printf("%s%-6s%s %-22s %-22s %s%-12s%s %-6d %-15s%s\n",
                ANSI_DIM, c.proto_str().c_str(), ANSI_RESET,
                (c.local_addr + ":" + std::to_string(c.local_port)).c_str(),
                (c.remote_addr + ":" + std::to_string(c.remote_port)).c_str(),
                state_col, c.state_str().c_str(), ANSI_RESET,
                c.pid,
-               trunc(c.process_name, 15).c_str());
+               trunc(c.process_name, 15).c_str(), ANSI_CLEAR_LINE);
     }
+    printf("%s", ANSI_CLEAR_DOWN);
 }
 
 void Terminal::draw_events(const DisplayData& d, const UiState& state,
@@ -470,35 +505,48 @@ void Terminal::draw_events(const DisplayData& d, const UiState& state,
     const char* filter_names[] = {"ALL","AUTH","PROC","NET","FILE","SYS"};
     printf(ANSI_BOLD ANSI_BCYAN " ── Security Events [%zu total]" ANSI_RESET
            "  Filter: " ANSI_YELLOW "%s" ANSI_RESET
-           "  (f=cycle, /=search)\n",
-           all.size(), filter_names[static_cast<int>(state.event_filter)]);
+           "  (f=cycle, /=search)%s\n",
+           all.size(), filter_names[static_cast<int>(state.event_filter)], ANSI_CLEAR_LINE);
 
+    int cur_row = top_row + 1;
     if (state.event_searching || !state.event_search.empty()) {
-        printf(ANSI_YELLOW " Search: %s_" ANSI_RESET "\n", state.event_search.c_str());
-        top_row++;
+        set_cursor(cur_row++, 1);
+        printf(ANSI_YELLOW " Search: %s_" ANSI_RESET "%s\n", state.event_search.c_str(), ANSI_CLEAR_LINE);
     }
 
-    printf(ANSI_BOLD "%-20s %-8s %-9s %-12s %s" ANSI_RESET "\n",
-           "TIME", "SEV", "CAT", "SOURCE", "TITLE / DETAILS");
+    set_cursor(cur_row++, 1);
+    printf(ANSI_BOLD "%-20s %-8s %-9s %-12s %s" ANSI_RESET "%s\n",
+           "TIME", "SEV", "CAT", "SOURCE", "TITLE / DETAILS", ANSI_CLEAR_LINE);
 
-    int visible = rows - 5;
+    int visible = std::max(0, rows - (cur_row - top_row));
     int scroll  = state.event_scroll;
-    // Clamp scroll
-    if (scroll > (int)filtered.size() - 1) scroll = std::max(0, (int)filtered.size() - 1);
+    if (scroll > static_cast<int>(filtered.size()) - 1)
+        scroll = std::max(0, static_cast<int>(filtered.size()) - 1);
 
-    for (int i = 0; i < visible && (i + scroll) < (int)filtered.size(); i++) {
+    int drawn = 0;
+    int title_width = std::max(10, cols - 54);
+    for (int i = 0; i < visible && (i + scroll) < static_cast<int>(filtered.size()); i++) {
         const auto& e = filtered[i + scroll];
-        printf("%s%-20s " ANSI_RESET "%-8s " ANSI_DIM "%-9s %-12s" ANSI_RESET " %s\n",
+        set_cursor(cur_row + i, 1);
+        printf("%s%-20s " ANSI_RESET "%-8s " ANSI_DIM "%-9s %-12s" ANSI_RESET " %s%s\n",
                severity_color(e.severity).c_str(),
                e.timestamp_str().c_str(),
                e.severity_str().c_str(),
                e.category_str().c_str(),
                trunc(e.source, 12).c_str(),
-               trunc(e.title, cols - 54).c_str());
+               trunc(e.title, title_width).c_str(),
+               ANSI_CLEAR_LINE);
+        drawn++;
+    }
+
+    for (int i = drawn; i < visible; ++i) {
+        set_cursor(cur_row + i, 1);
+        printf("%s\n", ANSI_CLEAR_LINE);
     }
 }
 
 void Terminal::draw_help(int rows, int cols) {
+    (void)rows; (void)cols;
     set_cursor(5, 1);
     printf(ANSI_BOLD ANSI_BCYAN " ── Keyboard Reference ──────────────────\n\n" ANSI_RESET);
     const char* help[] = {
@@ -525,13 +573,14 @@ void Terminal::draw_help(int rows, int cols) {
         nullptr
     };
     for (int i = 0; help[i]; i++)
-        printf("%s\n", help[i]);
+        printf("%s%s\n", help[i], ANSI_CLEAR_LINE);
+    printf("%s", ANSI_CLEAR_DOWN);
 }
 
 void Terminal::draw_footer(const UiState& state, int cols) {
     int rows, c2;
     get_terminal_size(rows, c2);
-    set_cursor(rows - 1, 1);
+    set_cursor(rows, 1);
 
     printf(ANSI_REVERSE ANSI_BOLD);
     std::string footer;
@@ -549,8 +598,7 @@ void Terminal::draw_footer(const UiState& state, int cols) {
             footer = " q:Quit  TAB:Switch  1-4:Panels";
             break;
     }
-    // Pad to full width
-    footer += std::string(std::max(0, cols - (int)footer.size()), ' ');
+    footer += std::string(std::max(0, cols - static_cast<int>(footer.size())), ' ');
     printf("%.*s" ANSI_RESET, cols, footer.c_str());
 }
 

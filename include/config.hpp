@@ -3,6 +3,8 @@
 #include <vector>
 #include <filesystem>
 
+#include "event_system.hpp"
+
 namespace config {
 
 struct AppConfig {
@@ -10,6 +12,8 @@ struct AppConfig {
     std::vector<std::filesystem::path> monitored_paths;
 
     // Thresholds
+    events::Severity terminal_bell   = events::Severity::HIGH;
+    events::Severity desktop_notify  = events::Severity::HIGH;
     int  ssh_fail_threshold    = 5;
     int  ssh_fail_window_secs  = 60;
     bool sound_enabled         = true;

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <fcntl.h>
 
 namespace proc {
 
@@ -39,18 +40,29 @@ uint64_t ProcessMonitor::total_cpu_jiffies() const {
     return u + n + s + i + w + r + x + st;
 }
 
+uint64_t ProcessMonitor::read_mem_total_kb() {
+    std::ifstream memf("/proc/meminfo");
+    if (!memf) return 0;
+    std::string k;
+    uint64_t v = 0;
+    memf >> k >> v;
+    return v;
+}
+
 void ProcessMonitor::refresh() {
     std::vector<ProcessInfo> new_procs;
+    std::unordered_map<int, Snapshot> new_prev;
     uint64_t total_now = total_cpu_jiffies();
     uint64_t total_delta = (total_now > prev_total_cpu_) ? total_now - prev_total_cpu_ : 1;
+    uint64_t mem_total_kb = read_mem_total_kb();
 
     DIR* dir = opendir("/proc");
     if (!dir) return;
 
     struct dirent* entry;
     while ((entry = readdir(dir)) != nullptr) {
-        if (entry->d_type != DT_DIR) continue;
-        char* end;
+        if (entry->d_type != DT_DIR && entry->d_type != DT_UNKNOWN) continue;
+        char* end = nullptr;
         long pid_l = strtol(entry->d_name, &end, 10);
         if (*end != '\0' || pid_l <= 0) continue;
         int pid = static_cast<int>(pid_l);
@@ -63,7 +75,13 @@ void ProcessMonitor::refresh() {
         auto it = prev_.find(pid);
         if (it != prev_.end()) prev_snap = &it->second;
 
-        read_stat(p, prev_snap, total_delta);
+        Snapshot sn{};
+        read_stat(p, prev_snap, total_delta, mem_total_kb, sn);
+        if (p.name.empty()) continue; // Process died or unreadable
+
+        sn.total_cpu_time = total_now;
+        new_prev[pid] = sn;
+
         read_cmdline(p);
         read_exe(p);
         read_username(p);
@@ -89,126 +107,104 @@ void ProcessMonitor::refresh() {
     }
     closedir(dir);
 
-    // Rebuild prev_ map
-    prev_.clear();
-    for (const auto& p : new_procs) {
-        // Re-read raw jiffies for next delta
-        std::string stat_path = "/proc/" + std::to_string(p.pid) + "/stat";
-        std::ifstream sf(stat_path);
-        if (!sf) continue;
-        std::string line;
-        std::getline(sf, line);
-        // Skip "pid (name) state ..."
-        auto rp = line.rfind(')');
-        if (rp == std::string::npos) continue;
-        std::istringstream ss(line.substr(rp + 2));
-        char state; long ppid; uint64_t skip;
-        ss >> state >> ppid;
-        for (int i = 0; i < 11; ++i) ss >> skip; // skip to utime
-        Snapshot sn;
-        ss >> sn.utime >> sn.stime;
-        sn.total_cpu_time = total_now;
-        prev_[p.pid] = sn;
-    }
-
+    std::lock_guard<std::mutex> lock(mutex_);
     prev_total_cpu_ = total_now;
+    prev_ = std::move(new_prev);
     procs_ = std::move(new_procs);
 }
 
 void ProcessMonitor::read_stat(ProcessInfo& p, const Snapshot* prev,
-                                uint64_t cpu_delta) const
+                               uint64_t cpu_delta, uint64_t mem_total_kb,
+                               Snapshot& out_snap) const
 {
     std::string path = "/proc/" + std::to_string(p.pid) + "/stat";
+
+    // Read UID directly via stat on /proc/<pid>/stat
+    struct stat pst{};
+    if (::stat(path.c_str(), &pst) == 0) {
+        p.uid = pst.st_uid;
+    } else {
+        p.uid = 65534;
+    }
+
     std::ifstream f(path);
     if (!f) return;
     std::string line;
-    std::getline(f, line);
+    if (!std::getline(f, line)) return;
 
     // Format: pid (name) state ppid pgroup session tty_nr ...
-    // Name can contain spaces/parens: find last ')' 
+    // Name can contain spaces/parens: find last ')'
     auto lp = line.find('(');
     auto rp = line.rfind(')');
-    if (lp == std::string::npos || rp == std::string::npos) return;
+    if (lp == std::string::npos || rp == std::string::npos || rp <= lp) return;
 
     p.name = line.substr(lp + 1, rp - lp - 1);
 
     std::istringstream ss(line.substr(rp + 2));
-    char state_c;
-    int ppid;
-    uint64_t skip, utime, stime, starttime;
-    uint64_t rss;
+    char state_c = '?';
+    int ppid = 0;
+    uint64_t skip = 0, utime = 0, stime = 0, starttime = 0;
+    uint64_t rss = 0;
 
     ss >> state_c >> ppid;
     for (int i = 0; i < 11; ++i) ss >> skip; // fields 5-15
-    ss >> utime >> stime; // fields 14,15
+    ss >> utime >> stime;                    // fields 14,15
     for (int i = 0; i < 6; ++i) ss >> skip;  // skip to starttime(22)
-    ss >> starttime;                           // field 22
-    ss >> skip >> rss;                         // vsize(23), rss(24)
+    ss >> starttime;                         // field 22
+    ss >> skip >> rss;                       // vsize(23), rss(24)
+
+    out_snap.utime = utime;
+    out_snap.stime = stime;
 
     p.ppid  = ppid;
     p.state = static_cast<ProcState>(state_c);
-    p.rss_kb = rss * 4; // pages → KB (assume 4K pages)
+    p.rss_kb = rss * 4; // pages -> KB (assume 4K pages)
 
     // CPU%
     if (prev && cpu_delta > 0) {
-        uint64_t proc_delta = (utime + stime) - (prev->utime + prev->stime);
-        p.cpu_pct = static_cast<float>(proc_delta) /
-                    static_cast<float>(cpu_delta) * 100.f;
+        uint64_t prev_proc = prev->utime + prev->stime;
+        uint64_t curr_proc = utime + stime;
+        if (curr_proc > prev_proc) {
+            uint64_t proc_delta = curr_proc - prev_proc;
+            p.cpu_pct = static_cast<float>(proc_delta) /
+                        static_cast<float>(cpu_delta) * 100.f;
+        }
     }
 
     // Memory%
-    std::ifstream memf("/proc/meminfo");
-    uint64_t mem_total_kb = 0;
-    if (memf) {
-        std::string k; uint64_t v;
-        memf >> k >> v;
-        mem_total_kb = v;
-    }
     if (mem_total_kb > 0)
         p.mem_pct = static_cast<float>(p.rss_kb) / static_cast<float>(mem_total_kb) * 100.f;
 
-    // Start time → epoch
+    // Start time -> epoch
     p.start_time_epoch = boot_time_ + starttime / static_cast<uint64_t>(tick_hz_);
     time_t t = static_cast<time_t>(p.start_time_epoch);
     char buf[32];
-    struct tm* tm_info = localtime(&t);
-    if (tm_info) {
-        strftime(buf, sizeof(buf), "%b%d %H:%M", tm_info);
+    struct tm tm_info{};
+    if (localtime_r(&t, &tm_info)) {
+        strftime(buf, sizeof(buf), "%b%d %H:%M", &tm_info);
         p.start_time_str = buf;
     }
-
-    p.uid = [&]() -> uid_t {
-        std::string status_path = "/proc/" + std::to_string(p.pid) + "/status";
-        std::ifstream sf(status_path);
-        std::string l;
-        while (std::getline(sf, l)) {
-            if (l.rfind("Uid:", 0) == 0) {
-                std::istringstream iss(l.substr(4));
-                uid_t uid;
-                iss >> uid;
-                return uid;
-            }
-        }
-        return 65534; // nobody
-    }();
 }
 
 void ProcessMonitor::read_cmdline(ProcessInfo& p) const {
     std::string path = "/proc/" + std::to_string(p.pid) + "/cmdline";
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return;
-    std::string content;
-    std::getline(f, content, '\0'); // First arg
-    // Replace nulls with spaces
-    std::string full;
-    char c;
-    f.seekg(0);
-    while (f.get(c)) {
-        full += (c == '\0') ? ' ' : c;
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return;
+
+    char buf[2048];
+    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+
+    if (n > 0) {
+        for (ssize_t i = 0; i < n; ++i) {
+            if (buf[i] == '\0') buf[i] = ' ';
+        }
+        while (n > 0 && buf[n - 1] == ' ') n--;
+        p.cmdline.assign(buf, static_cast<size_t>(n));
     }
-    if (!full.empty() && full.back() == ' ')
-        full.pop_back();
-    p.cmdline = full;
+    if (p.cmdline.empty()) {
+        p.cmdline = "[" + p.name + "]";
+    }
 }
 
 void ProcessMonitor::read_exe(ProcessInfo& p) const {
@@ -222,12 +218,27 @@ void ProcessMonitor::read_exe(ProcessInfo& p) const {
 }
 
 void ProcessMonitor::read_username(ProcessInfo& p) const {
+    auto it = username_cache_.find(p.uid);
+    if (it != username_cache_.end()) {
+        p.username = it->second;
+        return;
+    }
+
     struct passwd* pw = getpwuid(p.uid);
-    p.username = pw ? pw->pw_name : std::to_string(p.uid);
+    std::string uname = pw ? pw->pw_name : std::to_string(p.uid);
+    username_cache_[p.uid] = uname;
+    p.username = std::move(uname);
+}
+
+std::vector<ProcessInfo> ProcessMonitor::processes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return procs_;
 }
 
 std::vector<const ProcessInfo*> ProcessMonitor::sorted(SortField f) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<const ProcessInfo*> v;
+    v.reserve(procs_.size());
     for (const auto& p : procs_) v.push_back(&p);
     std::sort(v.begin(), v.end(), [f](const ProcessInfo* a, const ProcessInfo* b) {
         if (f == SortField::CPU) return a->cpu_pct  > b->cpu_pct;
@@ -238,6 +249,7 @@ std::vector<const ProcessInfo*> ProcessMonitor::sorted(SortField f) const {
 }
 
 std::vector<const ProcessInfo*> ProcessMonitor::filter(const std::string& query) const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<const ProcessInfo*> v;
     for (const auto& p : procs_) {
         if (p.name.find(query)    != std::string::npos ||
@@ -248,11 +260,10 @@ std::vector<const ProcessInfo*> ProcessMonitor::filter(const std::string& query)
 }
 
 ProcessInfo ProcessMonitor::detail(int pid) const {
-    // Find in current list
-    for (const auto& p : procs_)
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& p : procs_) {
         if (p.pid == pid) {
             ProcessInfo d = p;
-            // Count fds
             std::string fd_path = "/proc/" + std::to_string(pid) + "/fd";
             try {
                 d.fd_count = static_cast<int>(
@@ -261,6 +272,7 @@ ProcessInfo ProcessMonitor::detail(int pid) const {
             } catch (...) { d.fd_count = -1; }
             return d;
         }
+    }
     return {};
 }
 

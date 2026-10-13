@@ -3,6 +3,8 @@
 #include <string>
 #include <cstdint>
 
+#include <mutex>
+
 namespace cpu {
 
 struct CoreStats {
@@ -25,8 +27,8 @@ public:
     // Read /proc/stat and compute delta since last call
     void refresh();
 
-    float overall_pct() const  { return overall_; }
-    const std::vector<CoreStats>& cores() const { return cores_; }
+    float overall_pct() const;
+    std::vector<CoreStats> cores() const;
 
     // For unit-testing: compute pct from two raw snapshots
     static float compute_pct(const CpuSnapshot& prev, const CpuSnapshot& curr);
@@ -35,6 +37,7 @@ public:
     static std::vector<CpuSnapshot> read_proc_stat();
 
 private:
+    mutable std::mutex       mutex_;
     float                    overall_ = 0.f;
     std::vector<CoreStats>   cores_;
     std::vector<CpuSnapshot> prev_;

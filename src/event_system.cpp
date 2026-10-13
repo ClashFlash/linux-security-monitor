@@ -53,9 +53,11 @@ std::string Event::severity_str() const  { return severity_to_str(severity); }
 
 std::string Event::timestamp_str() const {
     auto t = std::chrono::system_clock::to_time_t(timestamp);
-    std::ostringstream ss;
-    ss << std::put_time(std::localtime(&t), "%Y-%m-%d %H:%M:%S");
-    return ss.str();
+    struct tm tm_buf{};
+    localtime_r(&t, &tm_buf);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    return buf;
 }
 
 std::string Event::to_json() const {
@@ -103,8 +105,13 @@ void EventLog::push(Event e) {
             ring_.pop_front();
         write_to_log(e);
     }
-    // Fire callbacks outside the lock to avoid deadlock
-    for (auto& cb : callbacks_)
+    // Fire callbacks outside the ring buffer lock to avoid deadlock
+    std::vector<Callback> cbs;
+    {
+        std::lock_guard<std::mutex> lock(cb_mutex_);
+        cbs = callbacks_;
+    }
+    for (auto& cb : cbs)
         cb(e);
 }
 
@@ -139,6 +146,7 @@ size_t EventLog::count() const {
 }
 
 void EventLog::on_event(Callback cb) {
+    std::lock_guard<std::mutex> lock(cb_mutex_);
     callbacks_.push_back(std::move(cb));
 }
 

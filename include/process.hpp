@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <unordered_map>
 
+#include <mutex>
+
 namespace proc {
 
 enum class ProcState : char {
@@ -48,7 +50,7 @@ public:
     // Refresh the process list; call twice ~2s apart for accurate CPU%
     void refresh();
 
-    const std::vector<ProcessInfo>& processes() const { return procs_; }
+    std::vector<ProcessInfo> processes() const;
 
     // Sorted view (does not modify procs_)
     std::vector<const ProcessInfo*> sorted(SortField f = SortField::CPU) const;
@@ -60,7 +62,8 @@ public:
     ProcessInfo detail(int pid) const;
 
 private:
-    std::vector<ProcessInfo> procs_;
+    mutable std::mutex                mutex_;
+    std::vector<ProcessInfo>          procs_;
     // Previous tick data for CPU delta
     struct Snapshot {
         uint64_t utime = 0, stime = 0;
@@ -70,12 +73,15 @@ private:
     uint64_t                          prev_total_cpu_ = 0;
     double                            tick_hz_        = 100.0;
     uint64_t                          boot_time_      = 0; // epoch seconds
+    mutable std::unordered_map<uid_t, std::string> username_cache_;
 
-    void read_stat(ProcessInfo& p, const Snapshot* prev, uint64_t cpu_delta) const;
+    void read_stat(ProcessInfo& p, const Snapshot* prev, uint64_t cpu_delta,
+                   uint64_t mem_total_kb, Snapshot& out_snap) const;
     void read_cmdline(ProcessInfo& p) const;
     void read_exe(ProcessInfo& p) const;
     void read_username(ProcessInfo& p) const;
     uint64_t total_cpu_jiffies() const;
+    static uint64_t read_mem_total_kb();
 };
 
 } // namespace proc

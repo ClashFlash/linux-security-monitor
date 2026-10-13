@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <mutex>
 
 namespace mem {
 
@@ -26,9 +27,10 @@ struct MemInfo {
 class MemoryMonitor {
 public:
     void refresh();
-    const MemInfo& info() const { return info_; }
+    MemInfo info() const;
 
 private:
+    mutable std::mutex mutex_;
     MemInfo info_;
 };
 

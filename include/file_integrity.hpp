@@ -9,6 +9,7 @@
 #include <mutex>
 #include <memory>
 #include <chrono>
+#include <condition_variable>
 
 namespace integrity {
 
@@ -50,8 +51,8 @@ public:
     // Manual scan — returns changes found
     std::vector<FileChange> scan();
 
-    const std::vector<FileChange>& history() const { return history_; }
-    const std::map<std::filesystem::path, FileRecord>& baseline_map() const { return baseline_; }
+    std::vector<FileChange> history() const;
+    std::map<std::filesystem::path, FileRecord> baseline_map() const;
 
 private:
     std::shared_ptr<events::EventLog>          event_log_;
@@ -61,6 +62,8 @@ private:
     mutable std::mutex                         mutex_;
     std::thread                                thread_;
     std::atomic<bool>                          running_{false};
+    std::condition_variable                    cv_;
+    std::mutex                                 cv_mutex_;
 
     void watch_loop();
     void collect_paths(const std::filesystem::path& root,

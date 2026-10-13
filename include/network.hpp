@@ -5,6 +5,8 @@
 #include <map>
 #include <cstdint>
 #include <chrono>
+#include <mutex>
+#include <unordered_map>
 
 namespace net {
 
@@ -45,8 +47,8 @@ public:
 
     void refresh();
 
-    const std::vector<Interface>&  interfaces()  const { return ifaces_; }
-    const std::vector<Connection>& connections() const { return conns_; }
+    std::vector<Interface>  interfaces()  const;
+    std::vector<Connection> connections() const;
 
     // Only LISTEN state
     std::vector<Connection> listening_ports() const;
@@ -58,6 +60,7 @@ public:
     std::vector<Connection> closed_connections() const;
 
 private:
+    mutable std::mutex      mutex_;
     std::vector<Interface>  ifaces_;
     std::vector<Connection> conns_;
     std::vector<Connection> prev_conns_;
@@ -67,8 +70,8 @@ private:
     bool               baseline_set_ = false;
 
     // PID → process name map (built from /proc/PID/fd symlinks)
-    std::map<uint64_t, int> inode_to_pid_;  // socket inode → pid
-    std::map<int, std::string> pid_to_name_;
+    std::unordered_map<uint64_t, int> inode_to_pid_;  // socket inode → pid
+    std::unordered_map<int, std::string> pid_to_name_;
 
     void parse_interfaces();
     void parse_connections(const std::string& path, Proto proto);

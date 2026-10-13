@@ -137,12 +137,14 @@ main.cpp                  — thin wiring: starts threads, runs UI loop
 
 ## Testing
 
-52 unit tests covering:
+61 unit tests covering:
 - CPU% calculation with synthetic /proc/stat deltas
 - SSH auth.log line parser (7 test cases, regex edge cases)
 - File integrity: SHA-256 known vectors, modification/creation/deletion detection
 - Security rules: all 6 rules with positive and negative cases + deduplication
 - Network hex parser: IP/port conversion with known values
+- Process monitor: PID/CPU/Memory sorting, process details, filtering, and caching
+- Configuration loader: threshold settings, aliases, comments, and whitespace trimming
 
 ```bash
 make test

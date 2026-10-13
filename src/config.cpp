@@ -44,11 +44,23 @@ AppConfig AppConfig::load(const std::filesystem::path& config_dir) {
             if (eq == std::string::npos) continue;
             std::string key = line.substr(0, eq);
             std::string val = line.substr(eq + 1);
+            while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+            while (!key.empty() && (key.front() == ' ' || key.front() == '\t')) key.erase(key.begin());
+            while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r')) val.pop_back();
+            while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
             try {
-                if (key == "ssh_fail_threshold")   c.ssh_fail_threshold   = std::stoi(val);
-                if (key == "ssh_fail_window_secs") c.ssh_fail_window_secs = std::stoi(val);
-                if (key == "sound_enabled")        c.sound_enabled   = (val == "true" || val == "1");
-                if (key == "notify_send_enabled")  c.notify_send_enabled = (val == "true" || val == "1");
+                if (key == "ssh_fail_threshold" || key == "ssh_fail_count")
+                    c.ssh_fail_threshold = std::stoi(val);
+                else if (key == "ssh_fail_window_secs" || key == "ssh_fail_window")
+                    c.ssh_fail_window_secs = std::stoi(val);
+                else if (key == "sound_enabled")
+                    c.sound_enabled = (val == "true" || val == "1");
+                else if (key == "notify_send_enabled" || key == "notify_enabled")
+                    c.notify_send_enabled = (val == "true" || val == "1");
+                else if (key == "terminal_bell")
+                    c.terminal_bell = events::str_to_severity(val);
+                else if (key == "desktop_notify")
+                    c.desktop_notify = events::str_to_severity(val);
             } catch (...) { /* ignore parse errors */ }
         }
     }

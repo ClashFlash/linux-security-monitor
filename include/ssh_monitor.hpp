@@ -11,6 +11,8 @@
 #include <mutex>
 #include <memory>
 
+#include <condition_variable>
+
 namespace ssh {
 
 struct AuthEvent {
@@ -44,8 +46,8 @@ public:
     void start();
     void stop();
 
-    const std::vector<AuthEvent>& recent_events() const { return events_; }
-    const std::map<std::string, IpStats>& ip_stats() const { return ip_stats_; }
+    std::vector<AuthEvent> recent_events() const;
+    std::map<std::string, IpStats> ip_stats() const;
 
     // Parse a single auth.log line (public for unit testing)
     static std::optional<AuthEvent> parse_line(const std::string& line);
@@ -56,6 +58,8 @@ private:
     int                               window_secs_;
     std::thread                       thread_;
     std::atomic<bool>                 running_{false};
+    std::condition_variable           cv_;
+    std::mutex                        cv_mutex_;
 
     std::vector<AuthEvent>            events_;
     std::map<std::string, IpStats>    ip_stats_;

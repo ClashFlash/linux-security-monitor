@@ -141,7 +141,18 @@ void FileIntegrityMonitor::start() {
 
 void FileIntegrityMonitor::stop() {
     running_ = false;
+    cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+}
+
+std::vector<FileChange> FileIntegrityMonitor::history() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return history_;
+}
+
+std::map<std::filesystem::path, FileRecord> FileIntegrityMonitor::baseline_map() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return baseline_;
 }
 
 FileRecord FileIntegrityMonitor::make_record(const std::filesystem::path& p) const {
@@ -194,8 +205,24 @@ std::vector<FileChange> FileIntegrityMonitor::scan() {
 
     std::map<std::filesystem::path, FileRecord> current;
     for (const auto& p : all) {
-        auto r = make_record(p);
-        if (r.exists) current[p] = r;
+        FileRecord r;
+        r.path = p;
+        r.exists = std::filesystem::exists(p);
+        if (!r.exists) continue;
+        try {
+            r.size  = std::filesystem::file_size(p);
+            r.mtime = std::filesystem::last_write_time(p);
+        } catch (...) {}
+
+        // Optimization: check if baseline already has this exact file with same size and mtime.
+        // If unchanged, reuse hash to avoid hashing gigabytes of disk every cycle.
+        auto base_it = baseline_.find(p);
+        if (base_it != baseline_.end() && base_it->second.size == r.size && base_it->second.mtime == r.mtime) {
+            r.hash = base_it->second.hash;
+        } else {
+            r.hash = sha256_file(p);
+        }
+        current[p] = std::move(r);
     }
 
     // Check for modifications and deletions
@@ -250,7 +277,9 @@ void FileIntegrityMonitor::emit_change(const FileChange& fc) {
 void FileIntegrityMonitor::watch_loop() {
     while (running_) {
         scan();
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        std::unique_lock<std::mutex> lock(cv_mutex_);
+        if (cv_.wait_for(lock, std::chrono::seconds(10), [this] { return !running_.load(); }))
+            break;
     }
 }
 

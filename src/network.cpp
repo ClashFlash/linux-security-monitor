@@ -47,8 +47,6 @@ NetworkMonitor::NetworkMonitor() {
 }
 
 void NetworkMonitor::refresh() {
-    prev_conns_ = conns_;
-    prev_ifaces_ = ifaces_;
     auto now = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(now - last_refresh_).count();
     if (elapsed < 0.001) elapsed = 1.0;
@@ -57,6 +55,8 @@ void NetworkMonitor::refresh() {
     build_inode_map();
     parse_interfaces();
 
+    std::vector<Connection> new_conns;
+    // Temporarily point conns_ to new_conns or parse into local
     conns_.clear();
     parse_connections("/proc/net/tcp",  Proto::TCP);
     parse_connections("/proc/net/tcp6", Proto::TCP6);
@@ -67,12 +67,26 @@ void NetworkMonitor::refresh() {
     for (auto& iface : ifaces_) {
         for (const auto& prev : prev_ifaces_) {
             if (prev.name == iface.name) {
-                iface.rx_rate = (iface.rx_bytes - prev.rx_bytes) / elapsed;
-                iface.tx_rate = (iface.tx_bytes - prev.tx_bytes) / elapsed;
+                iface.rx_rate = (iface.rx_bytes >= prev.rx_bytes) ? (iface.rx_bytes - prev.rx_bytes) / elapsed : 0.0;
+                iface.tx_rate = (iface.tx_bytes >= prev.tx_bytes) ? (iface.tx_bytes - prev.tx_bytes) / elapsed : 0.0;
                 break;
             }
         }
     }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    prev_conns_ = conns_;
+    prev_ifaces_ = ifaces_;
+}
+
+std::vector<Interface> NetworkMonitor::interfaces() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return ifaces_;
+}
+
+std::vector<Connection> NetworkMonitor::connections() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return conns_;
 }
 
 void NetworkMonitor::parse_interfaces() {
@@ -113,37 +127,46 @@ void NetworkMonitor::build_inode_map() {
 
     struct dirent* entry;
     while ((entry = readdir(proc_dir)) != nullptr) {
-        char* end;
+        if (entry->d_type != DT_DIR && entry->d_type != DT_UNKNOWN) continue;
+        char* end = nullptr;
         long pid_l = strtol(entry->d_name, &end, 10);
         if (*end != '\0' || pid_l <= 0) continue;
         int pid = static_cast<int>(pid_l);
-
-        // Read process name
-        std::string comm_path = "/proc/" + std::to_string(pid) + "/comm";
-        std::ifstream cf(comm_path);
-        std::string name;
-        if (std::getline(cf, name)) pid_to_name_[pid] = name;
 
         // Iterate /proc/PID/fd
         std::string fd_path = "/proc/" + std::to_string(pid) + "/fd";
         DIR* fd_dir = opendir(fd_path.c_str());
         if (!fd_dir) continue;
 
+        bool has_socket = false;
         struct dirent* fd_entry;
         while ((fd_entry = readdir(fd_dir)) != nullptr) {
-            if (fd_entry->d_type != DT_LNK) continue;
+            if (fd_entry->d_type != DT_LNK && fd_entry->d_type != DT_UNKNOWN) continue;
             std::string link_path = fd_path + "/" + fd_entry->d_name;
             char buf[256] = {};
             ssize_t len = readlink(link_path.c_str(), buf, sizeof(buf) - 1);
-            if (len <= 0) continue;
-            std::string target(buf, len);
+            if (len <= 9) continue;
+            buf[len] = '\0';
             // socket:[12345]
-            if (target.rfind("socket:[", 0) == 0) {
-                uint64_t inode = std::stoull(target.substr(8, target.size() - 9));
-                inode_to_pid_[inode] = pid;
+            if (strncmp(buf, "socket:[", 8) == 0 && buf[len - 1] == ']') {
+                buf[len - 1] = '\0';
+                char* parse_end = nullptr;
+                uint64_t inode = strtoull(buf + 8, &parse_end, 10);
+                if (inode > 0 && parse_end && *parse_end == '\0') {
+                    inode_to_pid_[inode] = pid;
+                    has_socket = true;
+                }
             }
         }
         closedir(fd_dir);
+
+        // Read process name only if process has socket
+        if (has_socket && pid_to_name_.find(pid) == pid_to_name_.end()) {
+            std::string comm_path = "/proc/" + std::to_string(pid) + "/comm";
+            std::ifstream cf(comm_path);
+            std::string name;
+            if (std::getline(cf, name)) pid_to_name_[pid] = name;
+        }
     }
     closedir(proc_dir);
 }
@@ -235,6 +258,7 @@ void NetworkMonitor::parse_connections(const std::string& path, Proto proto) {
 }
 
 std::vector<Connection> NetworkMonitor::listening_ports() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<Connection> v;
     for (const auto& c : conns_)
         if (c.state == ConnState::LISTEN) v.push_back(c);
@@ -242,6 +266,7 @@ std::vector<Connection> NetworkMonitor::listening_ports() const {
 }
 
 std::vector<Connection> NetworkMonitor::new_listening_ports() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!baseline_set_) return {};
     std::vector<Connection> v;
     for (const auto& c : conns_) {
@@ -253,6 +278,7 @@ std::vector<Connection> NetworkMonitor::new_listening_ports() const {
 }
 
 std::vector<Connection> NetworkMonitor::closed_connections() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     // Find ESTABLISHED connections from prev that are gone now
     std::vector<Connection> v;
     for (const auto& prev : prev_conns_) {

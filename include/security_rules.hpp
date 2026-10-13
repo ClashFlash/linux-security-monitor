@@ -49,8 +49,8 @@ public:
                   const std::vector<net::Connection>&    conns);
 
 private:
-    std::shared_ptr<events::EventLog> log_;
-    std::set<int>                     alerted_pids_;  // avoid duplicate alerts
+    std::shared_ptr<events::EventLog>       log_;
+    std::set<std::pair<int, std::string>>   alerted_rules_;  // avoid duplicate alerts
 };
 
 } // namespace rules

@@ -21,12 +21,18 @@ Thresholds Thresholds::load(const std::string& path) {
         if (eq == std::string::npos) continue;
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
-        if (key == "terminal_bell")    t.terminal_bell  = events::str_to_severity(val);
-        if (key == "desktop_notify")   t.desktop_notify = events::str_to_severity(val);
-        if (key == "ssh_fail_count")   t.ssh_fail_count = std::stoi(val);
-        if (key == "ssh_fail_window")  t.ssh_fail_window_secs = std::stoi(val);
-        if (key == "sound_enabled")    t.sound_enabled = (val == "true" || val == "1");
-        if (key == "notify_enabled")   t.notify_send_enabled = (val == "true" || val == "1");
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+        while (!key.empty() && (key.front() == ' ' || key.front() == '\t')) key.erase(key.begin());
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r')) val.pop_back();
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(val.begin());
+        try {
+            if (key == "terminal_bell")    t.terminal_bell  = events::str_to_severity(val);
+            else if (key == "desktop_notify")   t.desktop_notify = events::str_to_severity(val);
+            else if (key == "ssh_fail_count" || key == "ssh_fail_threshold")   t.ssh_fail_count = std::stoi(val);
+            else if (key == "ssh_fail_window" || key == "ssh_fail_window_secs")  t.ssh_fail_window_secs = std::stoi(val);
+            else if (key == "sound_enabled")    t.sound_enabled = (val == "true" || val == "1");
+            else if (key == "notify_enabled" || key == "notify_send_enabled")   t.notify_send_enabled = (val == "true" || val == "1");
+        } catch (...) { /* ignore parse errors */ }
     }
     return t;
 }
@@ -54,36 +60,41 @@ void Alerter::handle(const events::Event& e) {
 
 void Alerter::ring_bell() const {
     // Write BEL character to stderr (visible terminal)
-    write(STDERR_FILENO, "\a", 1);
+    ssize_t ret = write(STDERR_FILENO, "\a", 1);
+    (void)ret;
 }
 
 void Alerter::desktop_notify(const events::Event& e) const {
-    // Non-blocking fork+exec
+    // Prepare string arguments before fork to avoid heap allocation after fork
+    std::string urgency = "normal";
+    if (e.severity == events::Severity::CRITICAL || e.severity == events::Severity::HIGH)
+        urgency = "critical";
+
+    std::string title = "[" + e.severity_str() + "] " + e.title;
+    std::string body  = e.details.substr(0, 200);
+
+    // Double-fork idiom:
+    // First child forks the grandchild and exits immediately.
+    // Parent synchronously reaps the first child (< 1ms).
+    // Grandchild is adopted by init/systemd (PID 1) and reaped automatically.
+    // This avoids zombies, avoids signal races, and does not interfere with pclose().
     pid_t pid = fork();
     if (pid == 0) {
-        // Child
-        std::string urgency = "normal";
-        if (e.severity == events::Severity::CRITICAL) urgency = "critical";
-        if (e.severity == events::Severity::HIGH)     urgency = "critical";
-
-        std::string title   = "[" + e.severity_str() + "] " + e.title;
-        std::string body    = e.details.substr(0, 200);
-
-        execlp("notify-send", "notify-send",
-               "-u", urgency.c_str(),
-               "-t", "5000",
-               title.c_str(),
-               body.c_str(),
-               nullptr);
-        _exit(1); // exec failed
+        pid_t gpid = fork();
+        if (gpid == 0) {
+            execlp("notify-send", "notify-send",
+                   "-u", urgency.c_str(),
+                   "-t", "5000",
+                   title.c_str(),
+                   body.c_str(),
+                   nullptr);
+            _exit(1); // exec failed
+        }
+        _exit(0); // first child exits immediately
     }
-    // Parent doesn't wait — fire and forget
     if (pid > 0) {
-        // Reap async to avoid zombies
-        struct sigaction sa{};
-        sa.sa_handler = SIG_DFL;
-        sa.sa_flags   = SA_NOCLDWAIT;
-        sigaction(SIGCHLD, &sa, nullptr);
+        int status = 0;
+        waitpid(pid, &status, 0); // Reaps first child immediately
     }
 }
 
