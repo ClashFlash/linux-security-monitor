@@ -12,23 +12,24 @@
 
 namespace ui {
 
-// ─── ANSI codes ────────────────────────────────────────────────────────────
+// ─── ANSI codes (TrueColor / 24-bit with high contrast against adaptive wallpapers/transparency) ───
 #define ANSI_RESET   "\033[0m"
 #define ANSI_BOLD    "\033[1m"
 #define ANSI_DIM     "\033[2m"
 #define ANSI_REVERSE "\033[7m"
-#define ANSI_RED     "\033[31m"
-#define ANSI_GREEN   "\033[32m"
-#define ANSI_YELLOW  "\033[33m"
-#define ANSI_BLUE    "\033[34m"
-#define ANSI_MAGENTA "\033[35m"
-#define ANSI_CYAN    "\033[36m"
-#define ANSI_WHITE   "\033[37m"
-#define ANSI_BRED    "\033[91m"
-#define ANSI_BGREEN  "\033[92m"
-#define ANSI_BYELLOW "\033[93m"
-#define ANSI_BBLUE   "\033[94m"
-#define ANSI_BCYAN   "\033[96m"
+#define ANSI_RED     "\033[38;2;255;95;86m"
+#define ANSI_GREEN   "\033[38;2;40;210;120m"
+#define ANSI_YELLOW  "\033[38;2;255;215;0m"
+#define ANSI_BLUE    "\033[38;2;90;150;255m"
+#define ANSI_MAGENTA "\033[38;2;240;110;220m"
+#define ANSI_CYAN    "\033[38;2;80;230;240m"
+#define ANSI_WHITE   "\033[38;2;250;250;250m"
+#define ANSI_BRED    "\033[1;38;2;255;95;86m"
+#define ANSI_BGREEN  "\033[1;38;2;40;220;120m"
+#define ANSI_BYELLOW "\033[1;38;2;255;220;50m"
+#define ANSI_BBLUE   "\033[1;38;2;110;170;255m"
+#define ANSI_BCYAN   "\033[1;38;2;90;240;255m"
+#define ANSI_SEL_BG  "\033[48;2;45;75;135m\033[38;2;255;255;255m\033[1m"
 #define ANSI_CLEAR_LINE "\033[K"
 #define ANSI_CLEAR_DOWN "\033[J"
 
@@ -39,19 +40,21 @@ Terminal::Terminal() {
     struct termios raw;
     tcgetattr(STDIN_FILENO, &saved_termios);
     raw = saved_termios;
-    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG); // Disable echo, canonical mode, and signals interfering with keys
+    raw.c_iflag &= ~(IXON | ICRNL);        // Disable flow control and CR to NL mapping
     raw.c_cc[VMIN]  = 0;
-    raw.c_cc[VTIME] = 0; // non-blocking
+    raw.c_cc[VTIME] = 0;                   // Non-blocking
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
-    // Hide cursor, clear screen
-    printf("\033[?25l");
+    // Enter alternate screen buffer, hide cursor, clear screen
+    printf("\033[?1049h\033[?25l");
     clear_screen();
+    fflush(stdout);
 }
 
 Terminal::~Terminal() {
     tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
-    printf("\033[?25h" ANSI_RESET); // Show cursor
-    clear_screen();
+    // Show cursor, exit alternate screen buffer, reset styles
+    printf("\033[?25h\033[?1049l" ANSI_RESET);
     fflush(stdout);
 }
 
@@ -94,18 +97,50 @@ std::string Terminal::severity_color(events::Severity s) {
 // ─── Input ─────────────────────────────────────────────────────────────────
 
 int Terminal::get_key() {
-    char buf[8] = {};
-    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+    char buf[16] = {};
+    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf) - 1);
     if (n <= 0) return -1;
-    if (n == 1) return static_cast<unsigned char>(buf[0]);
-    // Escape sequences
-    if (buf[0] == '\033' && buf[1] == '[') {
-        if (buf[2] == 'A') return 1000; // Up
-        if (buf[2] == 'B') return 1001; // Down
-        if (buf[2] == 'C') return 1002; // Right
-        if (buf[2] == 'D') return 1003; // Left
-        if (buf[2] == '5' && buf[3] == '~') return 1004; // PgUp
-        if (buf[2] == '6' && buf[3] == '~') return 1005; // PgDn
+    if (n == 1) {
+        unsigned char c = static_cast<unsigned char>(buf[0]);
+        if (c == 10 || c == 13) return 13; // Normalize newline/return
+        return c;
+    }
+
+    // Escape sequences: ESC [ ... or ESC O ...
+    if (buf[0] == 27) {
+        if (buf[1] == '[') {
+            if (n >= 3) {
+                if (buf[2] == 'A') return 1000; // Up
+                if (buf[2] == 'B') return 1001; // Down
+                if (buf[2] == 'C') return 1002; // Right
+                if (buf[2] == 'D') return 1003; // Left
+                if (buf[2] == 'H') return 1006; // Home
+                if (buf[2] == 'F') return 1007; // End
+            }
+            if (n >= 4) {
+                if (buf[2] == '5' && buf[3] == '~') return 1004; // PgUp
+                if (buf[2] == '6' && buf[3] == '~') return 1005; // PgDn
+                if (buf[2] == '1' && buf[3] == '~') return 1006; // Home
+                if (buf[2] == '4' && buf[3] == '~') return 1007; // End
+                if (buf[2] == '7' && buf[3] == '~') return 1006; // Home
+                if (buf[2] == '8' && buf[3] == '~') return 1007; // End
+            }
+            if (n >= 4) {
+                if (buf[n - 1] == 'A') return 1000;
+                if (buf[n - 1] == 'B') return 1001;
+                if (buf[n - 1] == 'C') return 1002;
+                if (buf[n - 1] == 'D') return 1003;
+            }
+        } else if (buf[1] == 'O'&& n >= 3) {
+            // Application cursor mode SS3
+            if (buf[2] == 'A') return 1000; // Up
+            if (buf[2] == 'B') return 1001; // Down
+            if (buf[2] == 'C') return 1002; // Right
+            if (buf[2] == 'D') return 1003; // Left
+            if (buf[2] == 'H') return 1006; // Home
+            if (buf[2] == 'F') return 1007; // End
+        }
+        return 27; // ESC
     }
     return static_cast<unsigned char>(buf[0]);
 }
@@ -162,11 +197,19 @@ bool Terminal::handle_key(UiState& state, int key,
         if (key == 'c' || key == 'C') { state.proc_sort = proc::SortField::CPU; return true; }
         if (key == 'm' || key == 'M') { state.proc_sort = proc::SortField::MEM; return true; }
         if (key == 'p' || key == 'P') { state.proc_sort = proc::SortField::PID; return true; }
-        if (key == KEY_UP && state.proc_selected > 0)
+        if ((key == KEY_UP || key == 'k' || key == 'K') && state.proc_selected > 0)
             state.proc_selected--;
-        if (key == KEY_DOWN && state.proc_selected < static_cast<int>(procs.size()) - 1)
+        if ((key == KEY_DOWN || key == 'j' || key == 'J') && state.proc_selected < static_cast<int>(procs.size()) - 1)
             state.proc_selected++;
-        if (key == KEY_ENTER && !procs.empty() && state.proc_selected < static_cast<int>(procs.size())) {
+        if (key == 1006) // Home
+            state.proc_selected = 0;
+        if (key == 1007 && !procs.empty()) // End
+            state.proc_selected = static_cast<int>(procs.size()) - 1;
+        if (key == KEY_PGUP)
+            state.proc_selected = std::max(0, state.proc_selected - 10);
+        if (key == KEY_PGDN && !procs.empty())
+            state.proc_selected = std::min(static_cast<int>(procs.size()) - 1, state.proc_selected + 10);
+        if ((key == KEY_ENTER || key == 10) && !procs.empty() && state.proc_selected < static_cast<int>(procs.size())) {
             state.proc_detail = true;
         }
     }
@@ -186,15 +229,15 @@ bool Terminal::handle_key(UiState& state, int key,
             state.event_scroll = 0;
             return true;
         }
-        if (key == KEY_UP && state.event_scroll > 0) state.event_scroll--;
-        if (key == KEY_DOWN) state.event_scroll++;
+        if ((key == KEY_UP || key == 'k' || key == 'K') && state.event_scroll > 0) state.event_scroll--;
+        if (key == KEY_DOWN || key == 'j' || key == 'J') state.event_scroll++;
         if (key == KEY_PGUP) state.event_scroll = std::max(0, state.event_scroll - 10);
         if (key == KEY_PGDN) state.event_scroll += 10;
     }
 
     if (state.active_panel == Panel::NETWORK) {
-        if (key == KEY_UP && state.net_scroll > 0) state.net_scroll--;
-        if (key == KEY_DOWN) state.net_scroll++;
+        if ((key == KEY_UP || key == 'k' || key == 'K') && state.net_scroll > 0) state.net_scroll--;
+        if (key == KEY_DOWN || key == 'j' || key == 'J') state.net_scroll++;
     }
 
     return true;
@@ -363,22 +406,37 @@ void Terminal::draw_processes(const DisplayData& d, const UiState& state,
         else if (p->from_tmp || p->exe_deleted) row_col = ANSI_BYELLOW;
 
         set_cursor(top_row + row_offset + i, 1);
-        if (selected) printf(ANSI_REVERSE);
-        printf("%s", row_col);
+        if (selected) {
+            printf(ANSI_SEL_BG);
+        } else {
+            printf("%s", row_col);
+        }
 
         char state_c = static_cast<char>(p->state);
         std::string short_exe = p->exe_path.size() > 40
             ? p->exe_path.substr(p->exe_path.size() - 38)
             : p->exe_path;
 
-        printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %s%c%s %-20s %-*s %s",
-               p->pid, p->ppid,
-               trunc(p->username, 10).c_str(),
-               p->cpu_pct, p->mem_pct,
-               state_col, state_c, ANSI_RESET,
-               trunc(p->name, 20).c_str(),
-               exe_col_width, trunc(short_exe, exe_col_width).c_str(),
-               p->start_time_str.c_str());
+        if (selected) {
+            // High contrast text inside selection bar
+            printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %c  %-20s %-*s %s",
+                   p->pid, p->ppid,
+                   trunc(p->username, 10).c_str(),
+                   p->cpu_pct, p->mem_pct,
+                   state_c,
+                   trunc(p->name, 20).c_str(),
+                   exe_col_width, trunc(short_exe, exe_col_width).c_str(),
+                   p->start_time_str.c_str());
+        } else {
+            printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %s%c" ANSI_RESET "%s %-20s %-*s %s",
+                   p->pid, p->ppid,
+                   trunc(p->username, 10).c_str(),
+                   p->cpu_pct, p->mem_pct,
+                   state_col, state_c, row_col,
+                   trunc(p->name, 20).c_str(),
+                   exe_col_width, trunc(short_exe, exe_col_width).c_str(),
+                   p->start_time_str.c_str());
+        }
         printf(ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
         drawn_count++;
     }
@@ -555,7 +613,9 @@ void Terminal::draw_help(int rows, int cols) {
         "  h / 4        Show this help",
         "",
         "  PROCESSES:",
-        "    ↑ ↓        Navigate process list",
+        "    ↑ ↓ / j k  Navigate process list",
+        "    Home / End Jump to top / bottom",
+        "    PgUp / PgDn Jump 10 rows",
         "    Enter       Process detail screen",
         "    ESC         Back from detail",
         "    c           Sort by CPU%",
@@ -564,12 +624,13 @@ void Terminal::draw_help(int rows, int cols) {
         "    /           Search / filter by name",
         "",
         "  EVENTS:",
-        "    ↑ ↓ PgUp PgDn   Scroll events",
+        "    ↑ ↓ / j k   Scroll events",
+        "    PgUp / PgDn Page up / down",
         "    f           Cycle filter (All/Auth/Proc/Net/File/Sys)",
         "    /           Search event titles & details",
         "",
         "  NETWORK:",
-        "    ↑ ↓         Scroll connection list",
+        "    ↑ ↓ / j k   Scroll connection list",
         nullptr
     };
     for (int i = 0; help[i]; i++)
@@ -586,7 +647,7 @@ void Terminal::draw_footer(const UiState& state, int cols) {
     std::string footer;
     switch (state.active_panel) {
         case Panel::PROCESSES:
-            footer = " q:Quit  TAB:Switch  c:CPU  m:MEM  p:PID  /:Search  Enter:Detail  1-4:Panels";
+            footer = " q:Quit  TAB:Switch  ↑↓/jk:Nav  c:CPU  m:MEM  p:PID  /:Search  Enter:Detail  1-4:Panels";
             break;
         case Panel::NETWORK:
             footer = " q:Quit  TAB:Switch  ↑↓:Scroll  1-4:Panels";
