@@ -4,6 +4,8 @@
 #include <iomanip>
 #include <stdexcept>
 #include <filesystem>
+#include <algorithm>
+#include <cctype>
 
 namespace events {
 
@@ -46,13 +48,76 @@ Severity str_to_severity(const std::string& s) {
     return Severity::LOW;
 }
 
-// ─── Event methods ─────────────────────────────────────────────────────────
+std::string json_escape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (char c : in) {
+        if      (c == '"')  out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else                out += c;
+    }
+    return out;
+}
 
-std::string Event::category_str() const  { return category_to_str(category); }
-std::string Event::severity_str() const  { return severity_to_str(severity); }
+std::string json_unescape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '\\' && i + 1 < in.size()) {
+            char n = in[++i];
+            if      (n == 'n') out += '\n';
+            else if (n == 'r') out += '\r';
+            else if (n == 't') out += '\t';
+            else               out += n;
+        } else {
+            out += in[i];
+        }
+    }
+    return out;
+}
 
-std::string Event::timestamp_str() const {
-    auto t = std::chrono::system_clock::to_time_t(timestamp);
+std::string json_get(const std::string& obj, const std::string& key) {
+    std::string pat = "\"" + key + "\":\"";
+    auto pos = obj.find(pat);
+    if (pos == std::string::npos) {
+        // numeric / unquoted
+        pat = "\"" + key + "\":";
+        pos = obj.find(pat);
+        if (pos == std::string::npos) return "";
+        pos += pat.size();
+        while (pos < obj.size() && std::isspace(static_cast<unsigned char>(obj[pos]))) pos++;
+        if (pos < obj.size() && obj[pos] == '"') {
+            ++pos;
+            std::string raw;
+            for (; pos < obj.size(); ++pos) {
+                if (obj[pos] == '\\' && pos + 1 < obj.size()) { raw += obj[pos]; raw += obj[++pos]; continue; }
+                if (obj[pos] == '"') break;
+                raw += obj[pos];
+            }
+            return json_unescape(raw);
+        }
+        std::string raw;
+        while (pos < obj.size() && obj[pos] != ',' && obj[pos] != '}') {
+            raw += obj[pos++];
+        }
+        while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back()))) raw.pop_back();
+        return raw;
+    }
+    pos += pat.size();
+    std::string raw;
+    for (; pos < obj.size(); ++pos) {
+        if (obj[pos] == '\\' && pos + 1 < obj.size()) { raw += obj[pos]; raw += obj[++pos]; continue; }
+        if (obj[pos] == '"') break;
+        raw += obj[pos];
+    }
+    return json_unescape(raw);
+}
+
+std::string format_time(std::chrono::system_clock::time_point tp) {
+    auto t = std::chrono::system_clock::to_time_t(tp);
     struct tm tm_buf{};
     localtime_r(&t, &tm_buf);
     char buf[32];
@@ -60,26 +125,64 @@ std::string Event::timestamp_str() const {
     return buf;
 }
 
+std::chrono::system_clock::time_point parse_time(const std::string& s) {
+    struct tm tm_buf{};
+    if (strptime(s.c_str(), "%Y-%m-%d %H:%M:%S", &tm_buf) == nullptr)
+        return std::chrono::system_clock::now();
+    tm_buf.tm_isdst = -1;
+    auto t = mktime(&tm_buf);
+    return std::chrono::system_clock::from_time_t(t);
+}
+
+// ─── Event methods ─────────────────────────────────────────────────────────
+
+std::string Event::category_str() const  { return category_to_str(category); }
+std::string Event::severity_str() const  { return severity_to_str(severity); }
+
+std::string Event::timestamp_str() const {
+    return format_time(timestamp);
+}
+
 std::string Event::to_json() const {
-    // Simple hand-rolled JSON — avoids a dependency
-    auto escape = [](const std::string& in) {
-        std::string out;
-        for (char c : in) {
-            if      (c == '"')  out += "\\\"";
-            else if (c == '\\') out += "\\\\";
-            else if (c == '\n') out += "\\n";
-            else                out += c;
-        }
-        return out;
-    };
     std::ostringstream ss;
-    ss << "{\"ts\":\"" << escape(timestamp_str())
-       << "\",\"cat\":\"" << escape(category_str())
-       << "\",\"sev\":\"" << escape(severity_str())
-       << "\",\"src\":\"" << escape(source)
-       << "\",\"title\":\"" << escape(title)
-       << "\",\"details\":\"" << escape(details) << "\"}";
+    ss << "{\"ts\":\"" << json_escape(timestamp_str())
+       << "\",\"cat\":\"" << json_escape(category_str())
+       << "\",\"sev\":\"" << json_escape(severity_str())
+       << "\",\"src\":\"" << json_escape(source)
+       << "\",\"title\":\"" << json_escape(title)
+       << "\",\"details\":\"" << json_escape(details)
+       << "\",\"id\":\"" << json_escape(id)
+       << "\",\"gkey\":\"" << json_escape(grouping_key)
+       << "\",\"why\":\"" << json_escape(why_suspicious)
+       << "\",\"evidence\":\"" << json_escape(evidence)
+       << "\",\"next\":\"" << json_escape(next_steps)
+       << "\",\"pid\":" << pid
+       << ",\"ppid\":" << ppid
+       << ",\"exe\":\"" << json_escape(exe_path)
+       << "\",\"user\":\"" << json_escape(username)
+       << "\",\"extra\":\"" << json_escape(extra) << "\"}";
     return ss.str();
+}
+
+Event Event::from_json(const std::string& line) {
+    Event e;
+    e.timestamp       = parse_time(json_get(line, "ts"));
+    e.category        = str_to_category(json_get(line, "cat"));
+    e.severity        = str_to_severity(json_get(line, "sev"));
+    e.source          = json_get(line, "src");
+    e.title           = json_get(line, "title");
+    e.details         = json_get(line, "details");
+    e.id              = json_get(line, "id");
+    e.grouping_key    = json_get(line, "gkey");
+    e.why_suspicious  = json_get(line, "why");
+    e.evidence        = json_get(line, "evidence");
+    e.next_steps      = json_get(line, "next");
+    e.exe_path        = json_get(line, "exe");
+    e.username        = json_get(line, "user");
+    e.extra           = json_get(line, "extra");
+    try { e.pid  = std::stoi(json_get(line, "pid")); } catch (...) {}
+    try { e.ppid = std::stoi(json_get(line, "ppid")); } catch (...) {}
+    return e;
 }
 
 // ─── EventLog ──────────────────────────────────────────────────────────────
@@ -87,17 +190,47 @@ std::string Event::to_json() const {
 EventLog::EventLog(const std::filesystem::path& log_path)
     : log_path_(log_path)
 {
-    // Ensure parent directory exists
     if (!log_path_.empty()) {
         std::error_code ec;
         std::filesystem::create_directories(log_path_.parent_path(), ec);
-        // Non-fatal if we can't create the dir
     }
+    load_from_disk();
 }
 
 EventLog::~EventLog() = default;
 
+void EventLog::load_from_disk() {
+    if (log_path_.empty()) return;
+    std::ifstream f(log_path_);
+    if (!f) return;
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty()) lines.push_back(std::move(line));
+    }
+    size_t start = lines.size() > MAX_IN_MEMORY ? lines.size() - MAX_IN_MEMORY : 0;
+    uint64_t max_id = 0;
+    for (size_t i = start; i < lines.size(); ++i) {
+        Event e = Event::from_json(lines[i]);
+        if (e.title.empty() && e.details.empty()) continue;
+        if (!e.id.empty() && e.id.rfind("ev-", 0) == 0) {
+            try {
+                uint64_t n = std::stoull(e.id.substr(3));
+                if (n > max_id) max_id = n;
+            } catch (...) {}
+        }
+        ring_.push_back(std::move(e));
+    }
+    next_id_ = max_id + 1;
+}
+
 void EventLog::push(Event e) {
+    if (e.id.empty()) {
+        uint64_t n = next_id_.fetch_add(1);
+        std::ostringstream ss;
+        ss << "ev-" << std::setw(6) << std::setfill('0') << n;
+        e.id = ss.str();
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
         ring_.push_back(e);
@@ -105,7 +238,6 @@ void EventLog::push(Event e) {
             ring_.pop_front();
         write_to_log(e);
     }
-    // Fire callbacks outside the ring buffer lock to avoid deadlock
     std::vector<Callback> cbs;
     {
         std::lock_guard<std::mutex> lock(cb_mutex_);
@@ -134,7 +266,9 @@ std::vector<Event> EventLog::search(const std::string& kw) const {
     for (const auto& e : ring_) {
         if (e.title.find(kw) != std::string::npos ||
             e.details.find(kw) != std::string::npos ||
-            e.source.find(kw) != std::string::npos)
+            e.source.find(kw) != std::string::npos ||
+            e.evidence.find(kw) != std::string::npos ||
+            e.extra.find(kw) != std::string::npos)
             out.push_back(e);
     }
     return out;
@@ -156,7 +290,6 @@ void EventLog::write_to_log(const Event& e) {
         std::ofstream f(log_path_, std::ios::app);
         if (f) f << e.to_json() << "\n";
     } catch (...) {
-        // Non-fatal: we never crash because logging failed
     }
 }
 

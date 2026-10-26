@@ -9,6 +9,8 @@
 #include <iomanip>
 #include <ctime>
 #include <algorithm>
+#include <csignal>
+#include <map>
 
 namespace ui {
 
@@ -155,26 +157,79 @@ constexpr int KEY_ESC   = 27;
 constexpr int KEY_TAB   = 9;
 constexpr int KEY_BS    = 127;
 
-bool Terminal::handle_key(UiState& state, int key,
-                           const std::vector<const proc::ProcessInfo*>& procs,
-                           proc::ProcessMonitor& pm)
+bool Terminal::handle_key(UiState& state, int key, DisplayData& data)
 {
-    (void)pm;
+    const auto& procs = data.sorted_procs;
     if (key == -1) return true;
 
-    // Global keys
+    if (state.confirm != ConfirmAction::NONE) {
+        if (key == 'y' || key == 'Y') {
+            if (state.confirm == ConfirmAction::KILL_PROCESS && state.confirm_pid > 0) {
+                if (::kill(state.confirm_pid, SIGTERM) == 0) {
+                    state.status_message = "Sent SIGTERM to PID " + std::to_string(state.confirm_pid);
+                    if (data.events) {
+                        events::Event e;
+                        e.timestamp = std::chrono::system_clock::now();
+                        e.category = events::Category::SYSTEM;
+                        e.severity = events::Severity::MEDIUM;
+                        e.source = "response";
+                        e.title = "Process termination requested";
+                        e.details = "Operator confirmed SIGTERM for PID " + std::to_string(state.confirm_pid);
+                        e.why_suspicious = "Manual response action, not an automated kill.";
+                        e.evidence = "pid=" + std::to_string(state.confirm_pid) + " signal=SIGTERM";
+                        e.next_steps = "Confirm the process exited and watch for respawn.";
+                        e.pid = state.confirm_pid;
+                        e.grouping_key = "resp:kill:" + std::to_string(state.confirm_pid);
+                        data.events->push(std::move(e));
+                    }
+                } else {
+                    state.status_message = "Failed to signal PID " + std::to_string(state.confirm_pid);
+                }
+            } else if (state.confirm == ConfirmAction::REBASE && data.files) {
+                data.files->baseline();
+                state.status_message = "Integrity baseline re-established from current disk contents.";
+                if (data.events) {
+                    events::Event e;
+                    e.timestamp = std::chrono::system_clock::now();
+                    e.category = events::Category::SYSTEM;
+                    e.severity = events::Severity::LOW;
+                    e.source = "file_integrity";
+                    e.title = "File integrity baseline re-established";
+                    e.details = "Operator accepted current files as the new approved snapshot.";
+                    e.next_steps = "Future FILE alerts compare against this new snapshot.";
+                    data.events->push(std::move(e));
+                }
+            }
+            state.confirm = ConfirmAction::NONE;
+            state.confirm_pid = -1;
+            return true;
+        }
+        if (key == 'n' || key == 'N' || key == KEY_ESC) {
+            state.confirm = ConfirmAction::NONE;
+            state.confirm_pid = -1;
+            state.status_message = "Action cancelled";
+            return true;
+        }
+        return true;
+    }
+
     if (!state.proc_searching && !state.event_searching) {
         if (key == 'q' || key == 'Q') { state.quit = true; return false; }
         if (key == KEY_TAB || key == '\t') {
             state.active_panel = static_cast<Panel>(
-                (static_cast<int>(state.active_panel) + 1) % 4);
+                (static_cast<int>(state.active_panel) + 1) % 6);
             return true;
         }
         if (key == '1') { state.active_panel = Panel::PROCESSES; return true; }
         if (key == '2') { state.active_panel = Panel::NETWORK;   return true; }
-        if (key == '3') { state.active_panel = Panel::EVENTS;    return true; }
-        if (key == '4') { state.active_panel = Panel::HELP;      return true; }
-        if (key == 'h' || key == 'H') { state.active_panel = Panel::HELP; return true; }
+        if (key == '3') { state.active_panel = Panel::AUTH;      return true; }
+        if (key == '4') { state.active_panel = Panel::EVENTS;    return true; }
+        if (key == '5') { state.active_panel = Panel::INCIDENTS; return true; }
+        if (key == '6' || key == 'h' || key == 'H') { state.active_panel = Panel::HELP; return true; }
+        if (key == 'B') {
+            state.confirm = ConfirmAction::REBASE;
+            return true;
+        }
     }
 
     if (state.active_panel == Panel::PROCESSES) {
@@ -212,6 +267,10 @@ bool Terminal::handle_key(UiState& state, int key,
         if ((key == KEY_ENTER || key == 10) && !procs.empty() && state.proc_selected < static_cast<int>(procs.size())) {
             state.proc_detail = true;
         }
+        if (key == 'x' && !procs.empty() && state.proc_selected < static_cast<int>(procs.size())) {
+            state.confirm = ConfirmAction::KILL_PROCESS;
+            state.confirm_pid = procs[state.proc_selected]->pid;
+        }
     }
 
     if (state.active_panel == Panel::EVENTS) {
@@ -229,15 +288,80 @@ bool Terminal::handle_key(UiState& state, int key,
             state.event_scroll = 0;
             return true;
         }
-        if ((key == KEY_UP || key == 'k' || key == 'K') && state.event_scroll > 0) state.event_scroll--;
-        if (key == KEY_DOWN || key == 'j' || key == 'J') state.event_scroll++;
-        if (key == KEY_PGUP) state.event_scroll = std::max(0, state.event_scroll - 10);
-        if (key == KEY_PGDN) state.event_scroll += 10;
+        if (state.event_detail) {
+            if (key == KEY_ESC) { state.event_detail = false; return true; }
+        }
+        if ((key == KEY_UP || key == 'k' || key == 'K') && state.event_selected > 0) state.event_selected--;
+        if (key == KEY_DOWN || key == 'j' || key == 'J') state.event_selected++;
+        if (key == KEY_PGUP) state.event_selected = std::max(0, state.event_selected - 10);
+        if (key == KEY_PGDN) state.event_selected += 10;
+        if (key == KEY_ENTER) state.event_detail = true;
+        if (key == KEY_ESC) state.event_detail = false;
+        state.event_scroll = state.event_selected;
     }
 
     if (state.active_panel == Panel::NETWORK) {
-        if ((key == KEY_UP || key == 'k' || key == 'K') && state.net_scroll > 0) state.net_scroll--;
-        if (key == KEY_DOWN || key == 'j' || key == 'J') state.net_scroll++;
+        if ((key == KEY_UP || key == 'k' || key == 'K') && state.net_selected > 0) {
+            state.net_selected--;
+            if (state.net_scroll > state.net_selected) state.net_scroll = state.net_selected;
+        }
+        if (key == KEY_DOWN || key == 'j' || key == 'J') state.net_selected++;
+        if (key == 'l' || key == 'L') state.net_show_timeline = !state.net_show_timeline;
+        if ((key == 't' || key == 'T') && data.net &&
+            state.net_selected < static_cast<int>(data.connections.size())) {
+            const auto& c = data.connections[state.net_selected];
+            if (c.state == net::ConnState::LISTEN) {
+                if (data.net->is_trusted(c.local_port)) {
+                    data.net->untrust_port(c.local_port);
+                    state.status_message = "Untrusted port " + std::to_string(c.local_port);
+                } else {
+                    data.net->trust_port(c.local_port);
+                    state.status_message = "Trusted port " + std::to_string(c.local_port);
+                }
+            }
+        }
+    }
+
+    if (state.active_panel == Panel::AUTH) {
+        if ((key == KEY_UP || key == 'k' || key == 'K') && state.auth_selected > 0)
+            state.auth_selected--;
+        if (key == KEY_DOWN || key == 'j' || key == 'J') state.auth_selected++;
+    }
+
+    if (state.active_panel == Panel::INCIDENTS && data.incidents) {
+        auto list = data.incidents->snapshot();
+        if (state.inc_detail) {
+            if (key == KEY_ESC) { state.inc_detail = false; return true; }
+        }
+        if ((key == KEY_UP || key == 'k' || key == 'K') && state.inc_selected > 0)
+            state.inc_selected--;
+        if ((key == KEY_DOWN || key == 'j' || key == 'J') &&
+            state.inc_selected + 1 < static_cast<int>(list.size()))
+            state.inc_selected++;
+        if (key == KEY_ENTER && !list.empty()) state.inc_detail = true;
+        if (!list.empty() && state.inc_selected < static_cast<int>(list.size())) {
+            const auto& id = list[state.inc_selected].id;
+            if (key == 'a' || key == 'A')
+                data.incidents->set_status(id, incidents::Status::ACKNOWLEDGED);
+            if (key == 'i' || key == 'I')
+                data.incidents->set_status(id, incidents::Status::INVESTIGATING);
+            if (key == 'r' || key == 'R')
+                data.incidents->set_status(id, incidents::Status::RESOLVED);
+            if (key == 'e' || key == 'E') {
+                auto path = data.incidents->export_report(id, data.reports_dir);
+                state.status_message = path.empty() ? "Export failed"
+                                                    : "Exported " + path.string();
+            }
+            if (key == 'x' || key == 'X') {
+                int pid = list[state.inc_selected].related_pid;
+                if (pid > 0) {
+                    state.confirm = ConfirmAction::KILL_PROCESS;
+                    state.confirm_pid = pid;
+                } else {
+                    state.status_message = "No related PID to terminate";
+                }
+            }
+        }
     }
 
     if (state.active_panel == Panel::HELP) {
@@ -268,21 +392,29 @@ void Terminal::draw(const DisplayData& d, const UiState& state) {
         case Panel::PROCESSES:
             if (state.proc_detail && !d.sorted_procs.empty() &&
                 state.proc_selected < static_cast<int>(d.sorted_procs.size()))
-                draw_process_detail(*d.sorted_procs[state.proc_selected], rows, cols);
+                draw_process_detail(*d.sorted_procs[state.proc_selected], d, rows, cols);
             else
                 draw_processes(d, state, top_row, body_rows, cols);
             break;
         case Panel::NETWORK:
             draw_network(d, state, top_row, body_rows, cols);
             break;
+        case Panel::AUTH:
+            draw_auth(d, state, top_row, body_rows, cols);
+            break;
         case Panel::EVENTS:
             draw_events(d, state, top_row, body_rows, cols);
+            break;
+        case Panel::INCIDENTS:
+            draw_incidents(d, state, top_row, body_rows, cols);
             break;
         case Panel::HELP:
             draw_help(state, top_row, body_rows, cols);
             break;
     }
 
+    if (state.confirm != ConfirmAction::NONE)
+        draw_confirm(state, cols);
     draw_footer(state, cols);
     fflush(stdout);
 }
@@ -351,8 +483,10 @@ void Terminal::draw_tab_bar(const UiState& state, int cols) {
     Tab tabs[] = {
         {Panel::PROCESSES, " [1] Processes "},
         {Panel::NETWORK,   " [2] Network   "},
-        {Panel::EVENTS,    " [3] Events    "},
-        {Panel::HELP,      " [4] Help      "},
+        {Panel::AUTH,      " [3] Auth      "},
+        {Panel::EVENTS,    " [4] Events    "},
+        {Panel::INCIDENTS, " [5] Incidents "},
+        {Panel::HELP,      " [6] Help      "},
     };
     for (const auto& t : tabs) {
         if (t.p == state.active_panel)
@@ -483,29 +617,71 @@ void Terminal::draw_processes(const DisplayData& d, const UiState& state,
     }
 }
 
-void Terminal::draw_process_detail(const proc::ProcessInfo& p, int rows, int cols) {
+void Terminal::draw_process_detail(const proc::ProcessInfo& p, const DisplayData& d,
+                                    int rows, int cols)
+{
     (void)rows;
+    // Enrich with parent info from current snapshot
+    std::string parent_info = "—";
+    for (const auto* pp : d.sorted_procs) {
+        if (pp && pp->pid == p.ppid) {
+            parent_info = pp->name + " (pid=" + std::to_string(pp->pid) +
+                          " user=" + pp->username + ")";
+            break;
+        }
+    }
+    // Active connections for this PID
+    int conn_count = 0;
+    std::string conn_summary;
+    for (const auto& c : d.connections) {
+        if (c.pid != p.pid) continue;
+        conn_count++;
+        if (conn_count <= 3) {
+            if (!conn_summary.empty()) conn_summary += "  ";
+            conn_summary += c.proto_str() + " " + c.state_str() + " " +
+                            c.local_addr + ":" + std::to_string(c.local_port);
+            if (c.state == net::ConnState::ESTABLISHED)
+                conn_summary += " -> " + c.remote_addr + ":" + std::to_string(c.remote_port);
+        }
+    }
+    if (conn_count > 3)
+        conn_summary += " (+" + std::to_string(conn_count - 3) + " more)";
+    if (conn_summary.empty()) conn_summary = "none";
+
     set_cursor(5, 1);
     printf(ANSI_BOLD ANSI_BCYAN " ── Process Detail ──────────────────────" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
-    auto line = [&](const char* lbl, const std::string& val) {
-        printf(ANSI_BOLD " %-16s" ANSI_RESET " %s%s\n", lbl, val.c_str(), ANSI_CLEAR_LINE);
+    auto lbl = [&](const char* l, const std::string& val) {
+        printf(ANSI_BOLD " %-18s" ANSI_RESET " %s%s\n", l, val.c_str(), ANSI_CLEAR_LINE);
     };
-    line("PID:",       std::to_string(p.pid));
-    line("PPID:",      std::to_string(p.ppid));
-    line("User:",      p.username + " (uid=" + std::to_string(p.uid) + ")");
-    line("State:",     std::string(1, static_cast<char>(p.state)));
-    line("CPU%:",      std::to_string(p.cpu_pct).substr(0, 5) + "%");
-    line("Memory%:",   std::to_string(p.mem_pct).substr(0, 5) + "% (" + std::to_string(p.rss_kb / 1024) + " MiB)");
-    line("Name:",      p.name);
-    int cmd_width = std::max(10, cols - 20);
-    line("Cmdline:",   trunc(p.cmdline, cmd_width));
-    line("Exe:",       p.exe_path);
-    line("Started:",   p.start_time_str);
-    line("Open FDs:",  std::to_string(p.fd_count));
-    if (p.exe_deleted)          printf(ANSI_BRED " ⚠ Executable deleted" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
-    if (p.from_tmp)             printf(ANSI_BYELLOW " ⚠ Running from temp directory" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
-    if (p.root_from_suspicious) printf(ANSI_BRED " ⚠ Root process from suspicious path" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
-    printf(ANSI_DIM "\n Press ESC to return" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    lbl("PID:",          std::to_string(p.pid));
+    lbl("PPID (parent):", std::to_string(p.ppid) + "  " + parent_info);
+    lbl("User:",         p.username + " (uid=" + std::to_string(p.uid) + ")");
+    lbl("State:",        std::string(1, static_cast<char>(p.state)));
+    lbl("CPU%:",         std::to_string(p.cpu_pct).substr(0, 5) + "%");
+    lbl("Memory:",       std::to_string(p.mem_pct).substr(0, 5) + "%  RSS " +
+                         std::to_string(p.rss_kb / 1024) + " MiB");
+    lbl("Name:",         p.name);
+    int cmd_width = std::max(20, cols - 22);
+    lbl("Cmdline:",      trunc(p.cmdline, cmd_width));
+    lbl("Executable:",   p.exe_path);
+    lbl("Started:",      p.start_time_str);
+    lbl("Open FDs:",     std::to_string(p.fd_count));
+    lbl("Connections:",  conn_summary);
+
+    // Threat indicators
+    printf("\n");
+    if (p.root_from_suspicious)
+        printf(ANSI_BRED " ⚠ CRITICAL: Root process running from suspicious location" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    if (p.exe_deleted)
+        printf(ANSI_BRED " ⚠ HIGH: Executable was deleted from disk (possible evasion)" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    if (p.from_tmp)
+        printf(ANSI_BYELLOW " ⚠ HIGH: Running from temp/user-writable directory" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    if (p.from_writable_path && !p.from_tmp)
+        printf(ANSI_BYELLOW " ⚠ MEDIUM: Running from world/group-writable path" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    if (!p.root_from_suspicious && !p.exe_deleted && !p.from_tmp && !p.from_writable_path)
+        printf(ANSI_GREEN " ✓ No immediate threat indicators" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+
+    printf(ANSI_DIM "\n ESC:Back  x:Kill(SIGTERM)" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
     printf("%s", ANSI_CLEAR_DOWN);
 }
 
@@ -557,6 +733,293 @@ void Terminal::draw_network(const DisplayData& d, const UiState& state,
     printf("%s", ANSI_CLEAR_DOWN);
 }
 
+// ─── Auth panel ───────────────────────────────────────────────────────────
+
+void Terminal::draw_auth(const DisplayData& d, const UiState& state,
+                         int top_row, int rows, int cols)
+{
+    if (!d.ssh) {
+        set_cursor(top_row, 1);
+        printf(ANSI_DIM " SSH monitor not available.%s\n" ANSI_RESET, ANSI_CLEAR_LINE);
+        return;
+    }
+    auto events_snap = d.ssh->recent_events();
+    auto ip_stats    = d.ssh->ip_stats();
+
+    // Split view: top half = IP summary, bottom = event timeline
+    int half = rows / 2;
+
+    set_cursor(top_row, 1);
+    printf(ANSI_BOLD ANSI_BCYAN " ── Authentication Sources (%zu IPs) ────" ANSI_RESET "%s\n",
+           ip_stats.size(), ANSI_CLEAR_LINE);
+    printf(ANSI_BOLD "%-18s %6s %6s %6s %-12s %-20s" ANSI_RESET "%s\n",
+           "SOURCE IP", "FAILS", "OK", "INV", "LAST SEEN", "USERNAMES TRIED", ANSI_CLEAR_LINE);
+
+    int drawn = 0;
+    int ip_skip = state.auth_scroll;
+    // Sort IPs by fail count desc
+    std::vector<const ssh::IpStats*> sorted_ips;
+    for (const auto& [ip, st] : ip_stats) sorted_ips.push_back(&st);
+    std::sort(sorted_ips.begin(), sorted_ips.end(),
+        [](const ssh::IpStats* a, const ssh::IpStats* b) { return a->fail_count > b->fail_count; });
+
+    for (const auto* st : sorted_ips) {
+        if (ip_skip-- > 0) continue;
+        if (drawn >= half - 3) break;
+        bool selected = drawn == state.auth_selected;
+        const char* row_col = ANSI_RESET;
+        if (st->fail_count >= 10) row_col = ANSI_BRED;
+        else if (st->fail_count >= 5) row_col = ANSI_YELLOW;
+        else if (st->success_count > 0) row_col = ANSI_GREEN;
+
+        // Format last_seen
+        auto ts = std::chrono::system_clock::to_time_t(st->last_seen);
+        char tsbuf[32] = {};
+        struct tm tm_info{};
+        if (localtime_r(&ts, &tm_info)) strftime(tsbuf, sizeof(tsbuf), "%m/%d %H:%M", &tm_info);
+
+        // Usernames tried (show first 3)
+        std::string users;
+        int nu = 0;
+        for (const auto& u : st->usernames_tried) {
+            if (nu++ >= 3) { users += "+more"; break; }
+            if (!users.empty()) users += ",";
+            users += u;
+        }
+
+        set_cursor(top_row + 2 + drawn, 1);
+        if (selected)
+            printf(ANSI_SEL_BG "%-18s %6d %6d %6d %-12s %-20s" ANSI_RESET "%s\n",
+                   trunc(st->ip, 18).c_str(), st->fail_count, st->success_count,
+                   st->invalid_count, tsbuf, trunc(users, 20).c_str(), ANSI_CLEAR_LINE);
+        else
+            printf("%s%-18s %6d %6d %6d %-12s %-20s" ANSI_RESET "%s\n",
+                   row_col, trunc(st->ip, 18).c_str(), st->fail_count,
+                   st->success_count, st->invalid_count, tsbuf,
+                   trunc(users, 20).c_str(), ANSI_CLEAR_LINE);
+        drawn++;
+    }
+    for (int i = drawn; i < half - 3; ++i) {
+        set_cursor(top_row + 2 + i, 1);
+        printf("%s\n", ANSI_CLEAR_LINE);
+    }
+
+    // ── Timeline ──────────────────────────────────────────────────────────
+    int tl_top = top_row + half;
+    set_cursor(tl_top, 1);
+    printf(ANSI_BOLD ANSI_BCYAN " ── Auth Timeline (most recent first) ───" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    printf(ANSI_BOLD "%-20s %-11s %-16s %-12s" ANSI_RESET "%s\n",
+           "TIME", "TYPE", "SOURCE IP", "USERNAME", ANSI_CLEAR_LINE);
+
+    int tl_visible = rows - half - 2;
+    int tl_row = tl_top + 2;
+    int tl_drawn = 0;
+    // Newest first
+    for (int i = static_cast<int>(events_snap.size()) - 1;
+         i >= 0 && tl_drawn < tl_visible; --i) {
+        const auto& ev = events_snap[i];
+        auto ts2 = std::chrono::system_clock::to_time_t(ev.timestamp);
+        char ts2buf[32] = {};
+        struct tm tm2{};
+        if (localtime_r(&ts2, &tm2)) strftime(ts2buf, sizeof(ts2buf), "%m/%d %H:%M:%S", &tm2);
+
+        const char* type_col = ANSI_RESET;
+        const char* type_str = ev.type_str().c_str();
+        if (ev.type == ssh::AuthEvent::Type::FAIL || ev.type == ssh::AuthEvent::Type::INVALID_USER)
+            type_col = ANSI_YELLOW;
+        else if (ev.type == ssh::AuthEvent::Type::SUCCESS)
+            type_col = ANSI_GREEN;
+
+        set_cursor(tl_row + tl_drawn, 1);
+        printf("%-20s %s%-11s" ANSI_RESET " %-16s %-12s%s\n",
+               ts2buf, type_col, type_str,
+               trunc(ev.source_ip, 16).c_str(),
+               trunc(ev.username, 12).c_str(),
+               ANSI_CLEAR_LINE);
+        tl_drawn++;
+    }
+    for (int i = tl_drawn; i < tl_visible; ++i) {
+        set_cursor(tl_row + i, 1);
+        printf("%s\n", ANSI_CLEAR_LINE);
+    }
+    (void)cols;
+}
+
+// ─── Event detail overlay ─────────────────────────────────────────────────
+
+void Terminal::draw_event_detail(const events::Event& e, int rows, int cols)
+{
+    (void)rows;
+    set_cursor(5, 1);
+    printf(ANSI_BOLD ANSI_BCYAN " ── Event Detail ────────────────────────" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    auto lbl = [&](const char* l, const std::string& val) {
+        int vw = std::max(10, cols - 20);
+        printf(ANSI_BOLD " %-16s" ANSI_RESET " %s%s\n", l, trunc(val, vw).c_str(), ANSI_CLEAR_LINE);
+    };
+    lbl("ID:",         e.id);
+    lbl("Time:",       e.timestamp_str());
+    lbl("Severity:",   e.severity_str());
+    lbl("Category:",   e.category_str());
+    lbl("Source:",     e.source);
+    lbl("Title:",      e.title);
+    if (e.pid > 0) lbl("PID:",    std::to_string(e.pid));
+    if (e.ppid > 0) lbl("PPID:",  std::to_string(e.ppid));
+    if (!e.username.empty()) lbl("User:",    e.username);
+    if (!e.exe_path.empty()) lbl("Exe:",     e.exe_path);
+    if (!e.extra.empty())    lbl("Extra:",   e.extra);
+
+    if (!e.why_suspicious.empty()) {
+        printf(ANSI_BOLD ANSI_BYELLOW "\n Why suspicious:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+        printf("   %s%s\n", trunc(e.why_suspicious, cols - 4).c_str(), ANSI_CLEAR_LINE);
+    }
+    if (!e.evidence.empty()) {
+        printf(ANSI_BOLD "\n Evidence:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+        // Word-wrap evidence at cols - 4
+        std::string ev = e.evidence;
+        while (!ev.empty()) {
+            int take = std::min(static_cast<int>(ev.size()), cols - 4);
+            printf("   %s%s\n", ev.substr(0, take).c_str(), ANSI_CLEAR_LINE);
+            if (take >= static_cast<int>(ev.size())) break;
+            ev = ev.substr(take);
+        }
+    }
+    if (!e.next_steps.empty()) {
+        printf(ANSI_BOLD ANSI_BCYAN "\n What to check next:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+        printf("   %s%s\n", trunc(e.next_steps, cols - 4).c_str(), ANSI_CLEAR_LINE);
+    }
+    printf(ANSI_DIM "\n ESC:Back" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    printf("%s", ANSI_CLEAR_DOWN);
+}
+
+// ─── Incidents panel ──────────────────────────────────────────────────────
+
+void Terminal::draw_incidents(const DisplayData& d, const UiState& state,
+                               int top_row, int rows, int cols)
+{
+    if (!d.incidents) {
+        set_cursor(top_row, 1);
+        printf(ANSI_DIM " Incident store not available.%s\n" ANSI_RESET, ANSI_CLEAR_LINE);
+        return;
+    }
+    auto list = d.incidents->snapshot();
+
+    if (state.inc_detail && !list.empty() &&
+        state.inc_selected < static_cast<int>(list.size())) {
+        draw_incident_detail(list[state.inc_selected], rows, cols);
+        return;
+    }
+
+    set_cursor(top_row, 1);
+    printf(ANSI_BOLD ANSI_BCYAN " ── Incidents (%zu total, %zu open) ─────" ANSI_RESET "%s\n",
+           list.size(), d.incidents->count_open(), ANSI_CLEAR_LINE);
+    printf(ANSI_BOLD "%-10s %-11s %-9s %-9s %-20s %-20s" ANSI_RESET "%s\n",
+           "ID", "STATUS", "SEV", "CAT", "FIRST SEEN", "TITLE", ANSI_CLEAR_LINE);
+
+    int visible = std::max(0, rows - 3);
+    int skip    = state.inc_scroll;
+    int drawn   = 0;
+
+    for (int i = 0; i < static_cast<int>(list.size()) && drawn < visible; ++i) {
+        if (skip-- > 0) continue;
+        const auto& inc = list[i];
+        bool selected   = i == state.inc_selected;
+
+        const char* sev_col = severity_color(inc.max_severity).c_str();
+        const char* stat_col =
+            inc.status == incidents::Status::OPEN           ? ANSI_BRED :
+            inc.status == incidents::Status::ACKNOWLEDGED   ? ANSI_BYELLOW :
+            inc.status == incidents::Status::INVESTIGATING  ? ANSI_BCYAN :
+            inc.status == incidents::Status::RESOLVED       ? ANSI_GREEN : ANSI_RESET;
+
+        auto ts = std::chrono::system_clock::to_time_t(inc.first_seen);
+        char tsbuf[20] = {};
+        struct tm tm_info{};
+        if (localtime_r(&ts, &tm_info)) strftime(tsbuf, sizeof(tsbuf), "%m/%d %H:%M", &tm_info);
+
+        int title_w = std::max(10, cols - 73);
+        set_cursor(top_row + 2 + drawn, 1);
+        if (selected) {
+            printf(ANSI_SEL_BG "%-10s %-11s %-9s %-9s %-20s %-*s" ANSI_RESET "%s\n",
+                   trunc(inc.id, 10).c_str(),
+                   trunc(inc.status_str(), 11).c_str(),
+                   trunc(events::severity_to_str(inc.max_severity), 9).c_str(),
+                   trunc(events::category_to_str(inc.category), 9).c_str(),
+                   tsbuf,
+                   title_w, trunc(inc.title, title_w).c_str(), ANSI_CLEAR_LINE);
+        } else {
+            printf("%-10s %s%-11s" ANSI_RESET " %s%-9s" ANSI_RESET
+                   " %-9s %-20s %-*s%s\n",
+                   trunc(inc.id, 10).c_str(),
+                   stat_col, trunc(inc.status_str(), 11).c_str(),
+                   sev_col, trunc(events::severity_to_str(inc.max_severity), 9).c_str(),
+                   trunc(events::category_to_str(inc.category), 9).c_str(),
+                   tsbuf,
+                   title_w, trunc(inc.title, title_w).c_str(), ANSI_CLEAR_LINE);
+        }
+        drawn++;
+    }
+    for (int i = drawn; i < visible; ++i) {
+        set_cursor(top_row + 2 + i, 1);
+        printf("%s\n", ANSI_CLEAR_LINE);
+    }
+}
+
+void Terminal::draw_incident_detail(const incidents::Incident& inc, int rows, int cols)
+{
+    set_cursor(5, 1);
+    printf(ANSI_BOLD ANSI_BCYAN " ── Incident Detail ─────────────────────" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+    auto lbl = [&](const char* l, const std::string& val) {
+        int vw = std::max(10, cols - 20);
+        printf(ANSI_BOLD " %-16s" ANSI_RESET " %s%s\n", l, trunc(val, vw).c_str(), ANSI_CLEAR_LINE);
+    };
+    lbl("Incident ID:",  inc.id);
+    lbl("Status:",       inc.status_str());
+    lbl("Severity:",     events::severity_to_str(inc.max_severity));
+    lbl("Category:",     events::category_to_str(inc.category));
+    lbl("First seen:",   events::format_time(inc.first_seen));
+    lbl("Last seen:",    events::format_time(inc.last_seen));
+    lbl("Title:",        inc.title);
+    if (inc.related_pid > 0) lbl("Related PID:", std::to_string(inc.related_pid));
+    if (!inc.related_user.empty())  lbl("User:",  inc.related_user);
+    if (!inc.related_path.empty())  lbl("Path:",  inc.related_path);
+    if (!inc.extra.empty())         lbl("Key:",   inc.extra);
+
+    int ev_count = static_cast<int>(inc.evidence_events.size());
+    lbl("Evidence events:", std::to_string(ev_count));
+
+    if (!inc.explanation.empty()) {
+        printf(ANSI_BOLD ANSI_BYELLOW "\n Why suspicious:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+        printf("   %s%s\n", trunc(inc.explanation, cols - 4).c_str(), ANSI_CLEAR_LINE);
+    }
+    if (!inc.next_steps.empty()) {
+        printf(ANSI_BOLD ANSI_BCYAN "\n What to check next:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+        printf("   %s%s\n", trunc(inc.next_steps, cols - 4).c_str(), ANSI_CLEAR_LINE);
+    }
+
+    // Show up to 5 most recent evidence events
+    int show_ev = std::min(ev_count, 5);
+    if (show_ev > 0) {
+        printf(ANSI_BOLD "\n Recent evidence:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+        for (int i = ev_count - show_ev; i < ev_count; ++i) {
+            const auto& e = inc.evidence_events[i];
+            printf("  %s[%s] %s %s%s" ANSI_RESET " %s%s\n",
+                   severity_color(e.severity).c_str(),
+                   e.timestamp_str().c_str(),
+                   e.severity_str().c_str(),
+                   e.category_str().c_str(),
+                   ANSI_RESET,
+                   trunc(e.title, cols - 40).c_str(),
+                   ANSI_CLEAR_LINE);
+        }
+    }
+
+    // Status actions and available keys
+    printf(ANSI_DIM "\n ESC:Back  a:Acknowledge  i:Investigating  r:Resolve  e:Export  x:Kill PID" ANSI_RESET "%s\n",
+           ANSI_CLEAR_LINE);
+    printf("%s", ANSI_CLEAR_DOWN);
+    (void)rows;
+}
+
 void Terminal::draw_events(const DisplayData& d, const UiState& state,
                             int top_row, int rows, int cols)
 {
@@ -586,11 +1049,20 @@ void Terminal::draw_events(const DisplayData& d, const UiState& state,
     // Newest first
     std::reverse(filtered.begin(), filtered.end());
 
+    // Show detail overlay if requested
+    if (state.event_detail && !filtered.empty()) {
+        int sel = std::min(state.event_selected, static_cast<int>(filtered.size()) - 1);
+        if (sel >= 0) {
+            draw_event_detail(filtered[sel], rows, cols);
+            return;
+        }
+    }
+
     set_cursor(top_row, 1);
     const char* filter_names[] = {"ALL","AUTH","PROC","NET","FILE","SYS"};
     printf(ANSI_BOLD ANSI_BCYAN " ── Security Events [%zu total]" ANSI_RESET
            "  Filter: " ANSI_YELLOW "%s" ANSI_RESET
-           "  (f=cycle, /=search)%s\n",
+           "  (f=cycle, /=search, Enter=detail)%s\n",
            all.size(), filter_names[static_cast<int>(state.event_filter)], ANSI_CLEAR_LINE);
 
     int cur_row = top_row + 1;
@@ -612,15 +1084,26 @@ void Terminal::draw_events(const DisplayData& d, const UiState& state,
     int title_width = std::max(10, cols - 54);
     for (int i = 0; i < visible && (i + scroll) < static_cast<int>(filtered.size()); i++) {
         const auto& e = filtered[i + scroll];
+        bool selected = (i + scroll) == state.event_selected;
         set_cursor(cur_row + i, 1);
-        printf("%s%-20s " ANSI_RESET "%-8s " ANSI_DIM "%-9s %-12s" ANSI_RESET " %s%s\n",
-               severity_color(e.severity).c_str(),
-               e.timestamp_str().c_str(),
-               e.severity_str().c_str(),
-               e.category_str().c_str(),
-               trunc(e.source, 12).c_str(),
-               trunc(e.title, title_width).c_str(),
-               ANSI_CLEAR_LINE);
+        if (selected) {
+            printf(ANSI_SEL_BG "%-20s %-8s %-9s %-12s %s" ANSI_RESET "%s\n",
+                   e.timestamp_str().c_str(),
+                   e.severity_str().c_str(),
+                   e.category_str().c_str(),
+                   trunc(e.source, 12).c_str(),
+                   trunc(e.title, title_width).c_str(),
+                   ANSI_CLEAR_LINE);
+        } else {
+            printf("%s%-20s " ANSI_RESET "%-8s " ANSI_DIM "%-9s %-12s" ANSI_RESET " %s%s\n",
+                   severity_color(e.severity).c_str(),
+                   e.timestamp_str().c_str(),
+                   e.severity_str().c_str(),
+                   e.category_str().c_str(),
+                   trunc(e.source, 12).c_str(),
+                   trunc(e.title, title_width).c_str(),
+                   ANSI_CLEAR_LINE);
+        }
         drawn++;
     }
 
@@ -726,6 +1209,25 @@ void Terminal::draw_help(const UiState& state, int top_row, int rows, int cols) 
     }
 }
 
+void Terminal::draw_confirm(const UiState& state, int cols)
+{
+    int rows, c2;
+    get_terminal_size(rows, c2);
+    // Draw a centered confirmation prompt 3 rows from bottom
+    int y = rows - 4;
+    std::string msg;
+    if (state.confirm == ConfirmAction::KILL_PROCESS)
+        msg = "  Send SIGTERM to PID " + std::to_string(state.confirm_pid) + "? [y/N]  ";
+    else if (state.confirm == ConfirmAction::REBASE)
+        msg = "  Re-establish file integrity baseline from current disk state? [y/N]  ";
+    else
+        msg = "  Confirm action? [y/N]  ";
+
+    int start_col = std::max(1, (cols - static_cast<int>(msg.size())) / 2);
+    set_cursor(y, start_col);
+    printf(ANSI_REVERSE ANSI_BRED "%s" ANSI_RESET, msg.c_str());
+}
+
 void Terminal::draw_footer(const UiState& state, int cols) {
     int rows, c2;
     get_terminal_size(rows, c2);
@@ -735,17 +1237,28 @@ void Terminal::draw_footer(const UiState& state, int cols) {
     std::string footer;
     switch (state.active_panel) {
         case Panel::PROCESSES:
-            footer = " q:Quit  TAB:Switch  ↑↓/jk:Nav  c:CPU  m:MEM  p:PID  /:Search  Enter:Detail  1-4:Panels";
+            footer = " q:Quit  TAB:Next  ↑↓/jk:Nav  c:CPU  m:MEM  p:PID  /:Search  Enter:Detail  x:Kill  B:Rebaseline";
             break;
         case Panel::NETWORK:
-            footer = " q:Quit  TAB:Switch  ↑↓:Scroll  1-4:Panels";
+            footer = " q:Quit  TAB:Next  ↑↓:Scroll  t:Trust/Untrust  l:Timeline  1-6:Panels";
+            break;
+        case Panel::AUTH:
+            footer = " q:Quit  TAB:Next  ↑↓/jk:Nav  1-6:Panels";
             break;
         case Panel::EVENTS:
-            footer = " q:Quit  TAB:Switch  f:Filter  /:Search  ↑↓PgUp PgDn:Scroll  1-4:Panels";
+            footer = " q:Quit  TAB:Next  f:Filter  /:Search  ↑↓:Nav  Enter:Detail  ESC:Back  1-6:Panels";
+            break;
+        case Panel::INCIDENTS:
+            footer = " q:Quit  TAB:Next  ↑↓:Nav  Enter:Detail  a:Ack  i:Invest  r:Resolve  e:Export  x:Kill PID";
             break;
         case Panel::HELP:
-            footer = " q:Quit  TAB:Switch  ↑↓/jk/PgUp/PgDn:Scroll Help  1-4:Panels";
+            footer = " q:Quit  TAB:Next  ↑↓/jk/PgUp/PgDn:Scroll  1-6:Panels";
             break;
+    }
+    if (!state.status_message.empty()) {
+        std::string msg = "  [" + state.status_message + "]";
+        int pad = std::max(0, cols - static_cast<int>(footer.size()) - static_cast<int>(msg.size()));
+        footer += std::string(pad, ' ') + msg;
     }
     footer += std::string(std::max(0, cols - static_cast<int>(footer.size())), ' ');
     printf("%.*s" ANSI_RESET, cols, footer.c_str());

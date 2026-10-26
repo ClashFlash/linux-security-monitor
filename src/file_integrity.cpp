@@ -6,6 +6,9 @@
 #include <chrono>
 #include <stdexcept>
 #include <cstring>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <grp.h>
 
 // ─── SHA-256 (header-only implementation, no OpenSSL dep) ─────────────────
 // Public domain implementation based on RFC 6234
@@ -116,25 +119,69 @@ std::string sha256_file(const std::filesystem::path& path) {
 
 std::string FileChange::type_str() const {
     switch (type) {
-        case ChangeType::MODIFIED: return "MODIFIED";
-        case ChangeType::CREATED:  return "CREATED";
-        case ChangeType::DELETED:  return "DELETED";
+        case ChangeType::MODIFIED:     return "MODIFIED";
+        case ChangeType::CREATED:      return "CREATED";
+        case ChangeType::DELETED:      return "DELETED";
+        case ChangeType::PERM_CHANGED: return "PERM_CHANGED";
+        case ChangeType::NEW_STARTUP:  return "NEW_STARTUP";
     }
     return "?";
+}
+
+bool is_persistence_path(const std::filesystem::path& path) {
+    auto s = path.generic_string();
+    return s.find("/systemd/") != std::string::npos ||
+           s.find("/cron.") != std::string::npos ||
+           s.find("/cron/") != std::string::npos ||
+           (s.size() >= 12 && s.compare(s.size() - 12, 12, "/etc/crontab") == 0) ||
+           s.find("/init.d/") != std::string::npos ||
+           s.find("/xdg/autostart") != std::string::npos ||
+           s.find("/.config/autostart") != std::string::npos ||
+           s.find("/rc.local") != std::string::npos;
+}
+
+static std::string mode_str(mode_t m) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04o", static_cast<unsigned>(m & 07777));
+    return buf;
+}
+
+static std::string hash_short(const std::string& h) {
+    if (h.size() <= 16) return h;
+    return h.substr(0, 16) + "...";
 }
 
 // ─── FileIntegrityMonitor ──────────────────────────────────────────────────
 
 FileIntegrityMonitor::FileIntegrityMonitor(
     std::shared_ptr<events::EventLog> log,
-    std::vector<std::filesystem::path> watched)
-    : event_log_(std::move(log)), watched_(std::move(watched))
+    std::vector<std::filesystem::path> watched,
+    std::filesystem::path baseline_path)
+    : event_log_(std::move(log))
+    , watched_(std::move(watched))
+    , baseline_path_(std::move(baseline_path))
 {}
 
 FileIntegrityMonitor::~FileIntegrityMonitor() { stop(); }
 
 void FileIntegrityMonitor::start() {
-    baseline();
+    if (!load_persisted()) {
+        baseline();
+        if (event_log_) {
+            events::Event e;
+            e.timestamp = std::chrono::system_clock::now();
+            e.category  = events::Category::SYSTEM;
+            e.severity  = events::Severity::LOW;
+            e.source    = "file_integrity";
+            e.title     = "File integrity baseline established";
+            e.details   = "Captured " + std::to_string(approved_.size()) +
+                          " files as the approved snapshot. Later create/modify/delete/permission "
+                          "events are compared to this snapshot, not to 'whatever was on disk at last start'. "
+                          "Press B in the UI to deliberately re-establish the baseline after expected changes.";
+            e.next_steps = "Review monitored paths, then treat subsequent FILE alerts as deviations from this snapshot.";
+            event_log_->push(std::move(e));
+        }
+    }
     if (running_.exchange(true)) return;
     thread_ = std::thread(&FileIntegrityMonitor::watch_loop, this);
 }
@@ -152,7 +199,16 @@ std::vector<FileChange> FileIntegrityMonitor::history() const {
 
 std::map<std::filesystem::path, FileRecord> FileIntegrityMonitor::baseline_map() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return baseline_;
+    return approved_;
+}
+
+bool FileIntegrityMonitor::has_persisted_baseline() const {
+    return !baseline_path_.empty() && std::filesystem::exists(baseline_path_);
+}
+
+std::chrono::system_clock::time_point FileIntegrityMonitor::baseline_established_at() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return baseline_at_;
 }
 
 FileRecord FileIntegrityMonitor::make_record(const std::filesystem::path& p) const {
@@ -162,9 +218,16 @@ FileRecord FileIntegrityMonitor::make_record(const std::filesystem::path& p) con
     if (!r.exists) return r;
     r.hash   = sha256_file(p);
     try {
-        r.size   = std::filesystem::file_size(p);
-        r.mtime  = std::filesystem::last_write_time(p);
+        r.size = std::filesystem::file_size(p);
+        r.mtime_count = std::filesystem::last_write_time(p).time_since_epoch().count();
     } catch (...) {}
+    struct stat st{};
+    if (::stat(p.c_str(), &st) == 0) {
+        r.mode = st.st_mode;
+        r.uid  = st.st_uid;
+        r.gid  = st.st_gid;
+        r.size = static_cast<uintmax_t>(st.st_size);
+    }
     return r;
 }
 
@@ -175,7 +238,8 @@ void FileIntegrityMonitor::collect_paths(const std::filesystem::path& root,
     if (std::filesystem::is_regular_file(root, ec)) {
         out.push_back(root);
     } else if (std::filesystem::is_directory(root, ec)) {
-        for (const auto& e : std::filesystem::recursive_directory_iterator(root, ec)) {
+        for (const auto& e : std::filesystem::recursive_directory_iterator(
+                 root, std::filesystem::directory_options::skip_permission_denied, ec)) {
             if (!ec && e.is_regular_file()) out.push_back(e.path());
         }
     }
@@ -183,14 +247,69 @@ void FileIntegrityMonitor::collect_paths(const std::filesystem::path& root,
 
 void FileIntegrityMonitor::baseline() {
     std::lock_guard<std::mutex> lock(mutex_);
-    baseline_.clear();
+    approved_.clear();
+    alerted_keys_.clear();
 
     std::vector<std::filesystem::path> all;
     for (const auto& w : watched_) collect_paths(w, all);
 
     for (const auto& p : all) {
         auto r = make_record(p);
-        if (r.exists) baseline_[p] = r;
+        if (r.exists) approved_[p] = r;
+    }
+    last_scan_ = approved_;
+    baseline_at_ = std::chrono::system_clock::now();
+    save_persisted();
+}
+
+bool FileIntegrityMonitor::load_persisted() {
+    if (baseline_path_.empty()) return false;
+    std::ifstream f(baseline_path_);
+    if (!f) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    approved_.clear();
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        if (line.rfind("ESTABLISHED=", 0) == 0) {
+            baseline_at_ = events::parse_time(line.substr(12));
+            continue;
+        }
+        std::istringstream ss(line);
+        std::string path, hash, size_s, mt_s, mode_s, uid_s, gid_s;
+        if (!std::getline(ss, path, '\t')) continue;
+        if (!std::getline(ss, hash, '\t')) continue;
+        std::getline(ss, size_s, '\t');
+        std::getline(ss, mt_s, '\t');
+        std::getline(ss, mode_s, '\t');
+        std::getline(ss, uid_s, '\t');
+        std::getline(ss, gid_s, '\t');
+        FileRecord r;
+        r.path = path;
+        r.hash = hash;
+        r.exists = true;
+        try { r.size = std::stoull(size_s); } catch (...) {}
+        try { r.mtime_count = std::stoll(mt_s); } catch (...) {}
+        try { r.mode = static_cast<mode_t>(std::stoul(mode_s, nullptr, 8)); } catch (...) {}
+        try { r.uid = static_cast<uid_t>(std::stoul(uid_s)); } catch (...) {}
+        try { r.gid = static_cast<gid_t>(std::stoul(gid_s)); } catch (...) {}
+        approved_[r.path] = r;
+    }
+    last_scan_ = approved_;
+    return !approved_.empty();
+}
+
+void FileIntegrityMonitor::save_persisted() const {
+    if (baseline_path_.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(baseline_path_.parent_path(), ec);
+    std::ofstream f(baseline_path_, std::ios::trunc);
+    if (!f) return;
+    f << "ESTABLISHED=" << events::format_time(baseline_at_) << "\n";
+    for (const auto& [path, r] : approved_) {
+        f << path.string() << '\t' << r.hash << '\t' << r.size << '\t'
+          << r.mtime_count << '\t' << mode_str(r.mode) << '\t'
+          << r.uid << '\t' << r.gid << '\n';
     }
 }
 
@@ -199,7 +318,6 @@ std::vector<FileChange> FileIntegrityMonitor::scan() {
     std::vector<FileChange> changes;
     auto now = std::chrono::system_clock::now();
 
-    // Collect current state
     std::vector<std::filesystem::path> all;
     for (const auto& w : watched_) collect_paths(w, all);
 
@@ -207,17 +325,30 @@ std::vector<FileChange> FileIntegrityMonitor::scan() {
     for (const auto& p : all) {
         FileRecord r;
         r.path = p;
-        r.exists = std::filesystem::exists(p);
-        if (!r.exists) continue;
+        struct stat st{};
+        if (::stat(p.c_str(), &st) != 0) continue;
+        r.exists = true;
+        r.size = static_cast<uintmax_t>(st.st_size);
+        r.mode = st.st_mode;
+        r.uid  = st.st_uid;
+        r.gid  = st.st_gid;
         try {
-            r.size  = std::filesystem::file_size(p);
-            r.mtime = std::filesystem::last_write_time(p);
+            r.mtime_count = std::filesystem::last_write_time(p).time_since_epoch().count();
         } catch (...) {}
 
-        // Optimization: check if baseline already has this exact file with same size and mtime.
-        // If unchanged, reuse hash to avoid hashing gigabytes of disk every cycle.
-        auto base_it = baseline_.find(p);
-        if (base_it != baseline_.end() && base_it->second.size == r.size && base_it->second.mtime == r.mtime) {
+        auto cache_it = last_scan_.find(p);
+        auto base_it  = approved_.find(p);
+        if (cache_it != last_scan_.end() &&
+            cache_it->second.size == r.size &&
+            cache_it->second.mtime_count == r.mtime_count &&
+            cache_it->second.mode == r.mode &&
+            !cache_it->second.hash.empty()) {
+            r.hash = cache_it->second.hash;
+        } else if (base_it != approved_.end() &&
+                   base_it->second.size == r.size &&
+                   base_it->second.mtime_count == r.mtime_count &&
+                   base_it->second.mode == r.mode &&
+                   !base_it->second.hash.empty()) {
             r.hash = base_it->second.hash;
         } else {
             r.hash = sha256_file(p);
@@ -225,53 +356,125 @@ std::vector<FileChange> FileIntegrityMonitor::scan() {
         current[p] = std::move(r);
     }
 
-    // Check for modifications and deletions
-    for (const auto& [path, old_rec] : baseline_) {
+    auto maybe_emit = [&](FileChange fc) {
+        std::string key = fc.path.string() + "|" + fc.type_str() + "|" + fc.new_hash + "|" +
+                          mode_str(fc.new_mode);
+        if (!alerted_keys_.insert(key).second) return;
+        changes.push_back(fc);
+        history_.push_back(fc);
+        emit_change(fc);
+    };
+
+    for (const auto& [path, old_rec] : approved_) {
         auto it = current.find(path);
         if (it == current.end()) {
-            // Deleted
-            FileChange fc{ChangeType::DELETED, path, old_rec.hash, "", now};
-            changes.push_back(fc);
-            history_.push_back(fc);
-            emit_change(fc);
-        } else if (it->second.hash != old_rec.hash) {
-            // Modified
-            FileChange fc{ChangeType::MODIFIED, path, old_rec.hash, it->second.hash, now};
-            changes.push_back(fc);
-            history_.push_back(fc);
-            emit_change(fc);
+            FileChange fc;
+            fc.type = ChangeType::DELETED;
+            fc.path = path;
+            fc.old_hash = old_rec.hash;
+            fc.old_mode = old_rec.mode;
+            fc.old_uid = old_rec.uid;
+            fc.old_gid = old_rec.gid;
+            fc.old_size = old_rec.size;
+            fc.timestamp = now;
+            maybe_emit(fc);
+            continue;
+        }
+        const auto& cur = it->second;
+        if (cur.hash != old_rec.hash) {
+            FileChange fc;
+            fc.type = ChangeType::MODIFIED;
+            fc.path = path;
+            fc.old_hash = old_rec.hash;
+            fc.new_hash = cur.hash;
+            fc.old_mode = old_rec.mode;
+            fc.new_mode = cur.mode;
+            fc.old_uid = old_rec.uid;
+            fc.new_uid = cur.uid;
+            fc.old_gid = old_rec.gid;
+            fc.new_gid = cur.gid;
+            fc.old_size = old_rec.size;
+            fc.new_size = cur.size;
+            fc.timestamp = now;
+            maybe_emit(fc);
+        } else if (cur.mode != old_rec.mode || cur.uid != old_rec.uid || cur.gid != old_rec.gid) {
+            FileChange fc;
+            fc.type = ChangeType::PERM_CHANGED;
+            fc.path = path;
+            fc.old_hash = old_rec.hash;
+            fc.new_hash = cur.hash;
+            fc.old_mode = old_rec.mode;
+            fc.new_mode = cur.mode;
+            fc.old_uid = old_rec.uid;
+            fc.new_uid = cur.uid;
+            fc.old_gid = old_rec.gid;
+            fc.new_gid = cur.gid;
+            fc.old_size = old_rec.size;
+            fc.new_size = cur.size;
+            fc.timestamp = now;
+            maybe_emit(fc);
         }
     }
 
-    // Check for new files
     for (const auto& [path, rec] : current) {
-        if (baseline_.find(path) == baseline_.end()) {
-            FileChange fc{ChangeType::CREATED, path, "", rec.hash, now};
-            changes.push_back(fc);
-            history_.push_back(fc);
-            emit_change(fc);
-        }
+        if (approved_.find(path) != approved_.end()) continue;
+        FileChange fc;
+        fc.type = is_persistence_path(path) ? ChangeType::NEW_STARTUP : ChangeType::CREATED;
+        fc.path = path;
+        fc.new_hash = rec.hash;
+        fc.new_mode = rec.mode;
+        fc.new_uid = rec.uid;
+        fc.new_gid = rec.gid;
+        fc.new_size = rec.size;
+        fc.timestamp = now;
+        maybe_emit(fc);
     }
 
-    // Update baseline
-    baseline_ = current;
+    last_scan_ = std::move(current);
     return changes;
 }
 
 void FileIntegrityMonitor::emit_change(const FileChange& fc) {
-    auto sev = (fc.type == ChangeType::MODIFIED) ? events::Severity::HIGH
-             : (fc.type == ChangeType::DELETED)   ? events::Severity::HIGH
-                                                   : events::Severity::MEDIUM;
-    event_log_->push({
-        fc.timestamp,
-        events::Category::FILE,
-        sev,
-        "file_integrity",
-        "File " + fc.type_str() + ": " + fc.path.filename().string(),
-        fc.path.string() +
-            (fc.old_hash.empty() ? "" : "\nOld: " + fc.old_hash.substr(0, 16) + "...") +
-            (fc.new_hash.empty() ? "" : "\nNew: " + fc.new_hash.substr(0, 16) + "...")
-    });
+    events::Severity sev = events::Severity::MEDIUM;
+    if (fc.type == ChangeType::MODIFIED || fc.type == ChangeType::DELETED ||
+        fc.type == ChangeType::NEW_STARTUP)
+        sev = events::Severity::HIGH;
+    if (fc.path.filename() == "shadow" || fc.path.filename() == "sudoers" ||
+        fc.path.string().find("sshd_config") != std::string::npos)
+        sev = events::Severity::CRITICAL;
+
+    events::Event e;
+    e.timestamp = fc.timestamp;
+    e.category  = events::Category::FILE;
+    e.severity  = sev;
+    e.source    = "file_integrity";
+    e.title     = (fc.type == ChangeType::NEW_STARTUP)
+                    ? ("New startup/service entry: " + fc.path.filename().string())
+                    : ("File " + fc.type_str() + ": " + fc.path.filename().string());
+    e.grouping_key = "file:" + fc.path.string();
+    e.extra        = fc.path.string();
+    e.exe_path     = fc.path.string();
+    e.why_suspicious =
+        (fc.type == ChangeType::NEW_STARTUP)
+            ? "A new file appeared in a persistence location (systemd, cron, init, autostart)."
+            : "The file no longer matches the operator-established integrity baseline.";
+    std::ostringstream ev;
+    ev << "path=" << fc.path.string()
+       << " type=" << fc.type_str()
+       << " old_hash=" << hash_short(fc.old_hash)
+       << " new_hash=" << hash_short(fc.new_hash)
+       << " old_mode=" << mode_str(fc.old_mode)
+       << " new_mode=" << mode_str(fc.new_mode)
+       << " old_uid=" << fc.old_uid << " new_uid=" << fc.new_uid
+       << " old_gid=" << fc.old_gid << " new_gid=" << fc.new_gid
+       << " old_size=" << fc.old_size << " new_size=" << fc.new_size
+       << " ts=" << events::format_time(fc.timestamp);
+    e.evidence = ev.str();
+    e.next_steps = "Diff against a known-good copy; if the change was expected, re-establish the baseline (B). "
+                   "Do not assume malware from a single package-manager write.";
+    e.details = "What: " + e.title + "\nWhy: " + e.why_suspicious +
+                "\nEvidence: " + e.evidence + "\nNext: " + e.next_steps;
+    event_log_->push(std::move(e));
 }
 
 void FileIntegrityMonitor::watch_loop() {

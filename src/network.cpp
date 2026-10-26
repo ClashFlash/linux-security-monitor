@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <chrono>
+#include <map>
 
 namespace net {
 
@@ -34,16 +35,86 @@ std::string Connection::proto_str() const {
     return "?";
 }
 
+std::string ConnChange::type_str() const {
+    switch (type) {
+        case ConnChangeType::NEW_LISTEN:      return "NEW_LISTEN";
+        case ConnChangeType::CLOSED_LISTEN:   return "CLOSED_LISTEN";
+        case ConnChangeType::NEW_ESTABLISHED: return "NEW_ESTABLISHED";
+        case ConnChangeType::CLOSED:          return "CLOSED";
+        case ConnChangeType::BURST:           return "BURST";
+    }
+    return "?";
+}
+
 // ─── NetworkMonitor ────────────────────────────────────────────────────────
 
-NetworkMonitor::NetworkMonitor() {
+NetworkMonitor::NetworkMonitor() : NetworkMonitor(std::filesystem::path{}) {}
+
+NetworkMonitor::NetworkMonitor(std::filesystem::path trusted_path)
+    : trusted_path_(std::move(trusted_path))
+{
     last_refresh_ = std::chrono::steady_clock::now();
-    refresh(); // Initial snapshot (captures baseline listening ports)
+    load_trusted();
+    refresh();
     baseline_listen_ports_.clear();
     for (const auto& c : conns_)
         if (c.state == ConnState::LISTEN)
             baseline_listen_ports_.insert(c.local_port);
     baseline_set_ = true;
+    timeline_.clear(); // baseline itself is not a change
+}
+
+void NetworkMonitor::load_trusted() {
+    if (trusted_path_.empty()) return;
+    std::ifstream f(trusted_path_);
+    if (!f) return;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        try { trusted_ports_.insert(static_cast<uint16_t>(std::stoi(line))); } catch (...) {}
+    }
+}
+
+void NetworkMonitor::save_trusted() const {
+    if (trusted_path_.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(trusted_path_.parent_path(), ec);
+    std::ofstream f(trusted_path_, std::ios::trunc);
+    if (!f) return;
+    for (uint16_t p : trusted_ports_) f << p << "\n";
+}
+
+void NetworkMonitor::trust_port(uint16_t port) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    trusted_ports_.insert(port);
+    save_trusted();
+}
+
+void NetworkMonitor::untrust_port(uint16_t port) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    trusted_ports_.erase(port);
+    save_trusted();
+}
+
+bool NetworkMonitor::is_trusted(uint16_t port) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return trusted_ports_.count(port) != 0;
+}
+
+std::set<uint16_t> NetworkMonitor::trusted_ports() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return trusted_ports_;
+}
+
+std::vector<ConnChange> NetworkMonitor::timeline() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return timeline_;
+}
+
+static bool same_tuple(const Connection& a, const Connection& b) {
+    return a.local_addr == b.local_addr && a.local_port == b.local_port &&
+           a.remote_addr == b.remote_addr && a.remote_port == b.remote_port &&
+           a.proto == b.proto;
 }
 
 void NetworkMonitor::refresh() {
@@ -55,15 +126,12 @@ void NetworkMonitor::refresh() {
     build_inode_map();
     parse_interfaces();
 
-    std::vector<Connection> new_conns;
-    // Temporarily point conns_ to new_conns or parse into local
-    conns_.clear();
-    parse_connections("/proc/net/tcp",  Proto::TCP);
-    parse_connections("/proc/net/tcp6", Proto::TCP6);
-    parse_connections("/proc/net/udp",  Proto::UDP);
-    parse_connections("/proc/net/udp6", Proto::UDP6);
+    std::vector<Connection> parsed;
+    parse_connections(parsed, "/proc/net/tcp",  Proto::TCP);
+    parse_connections(parsed, "/proc/net/tcp6", Proto::TCP6);
+    parse_connections(parsed, "/proc/net/udp",  Proto::UDP);
+    parse_connections(parsed, "/proc/net/udp6", Proto::UDP6);
 
-    // Compute interface rates
     for (auto& iface : ifaces_) {
         for (const auto& prev : prev_ifaces_) {
             if (prev.name == iface.name) {
@@ -74,8 +142,50 @@ void NetworkMonitor::refresh() {
         }
     }
 
+    auto wall = std::chrono::system_clock::now();
     std::lock_guard<std::mutex> lock(mutex_);
-    prev_conns_ = conns_;
+
+    auto record = [&](ConnChangeType t, const Connection& c, const std::string& note) {
+        ConnChange ch;
+        ch.timestamp = wall;
+        ch.type = t;
+        ch.conn = c;
+        ch.note = note;
+        timeline_.push_back(std::move(ch));
+        if (timeline_.size() > 500) timeline_.erase(timeline_.begin(), timeline_.begin() + 50);
+    };
+
+    if (!prev_conns_.empty() || baseline_set_) {
+        for (const auto& c : parsed) {
+            bool found = false;
+            for (const auto& prev : conns_) {
+                if (same_tuple(prev, c)) { found = true; break; }
+            }
+            if (found) continue;
+            if (c.state == ConnState::LISTEN) {
+                std::string note = "listen " + std::to_string(c.local_port) + " owner=" + c.owner_label();
+                if (!c.owner_known()) note += " (attribution uncertain)";
+                record(ConnChangeType::NEW_LISTEN, c, note);
+            } else if (c.state == ConnState::ESTABLISHED || c.state == ConnState::SYN_SENT) {
+                record(ConnChangeType::NEW_ESTABLISHED, c,
+                       c.remote_addr + ":" + std::to_string(c.remote_port) + " owner=" + c.owner_label());
+            }
+        }
+        for (const auto& prev : conns_) {
+            bool found = false;
+            for (const auto& c : parsed) {
+                if (same_tuple(prev, c)) { found = true; break; }
+            }
+            if (found) continue;
+            if (prev.state == ConnState::LISTEN)
+                record(ConnChangeType::CLOSED_LISTEN, prev, "closed listen " + std::to_string(prev.local_port));
+            else if (prev.state == ConnState::ESTABLISHED)
+                record(ConnChangeType::CLOSED, prev, "closed " + prev.remote_addr + ":" + std::to_string(prev.remote_port));
+        }
+    }
+
+    prev_conns_ = std::move(conns_);
+    conns_ = std::move(parsed);
     prev_ifaces_ = ifaces_;
 }
 
@@ -216,7 +326,7 @@ ConnState NetworkMonitor::hex_to_state(const std::string& hex) {
     }
 }
 
-void NetworkMonitor::parse_connections(const std::string& path, Proto proto) {
+void NetworkMonitor::parse_connections(std::vector<Connection>& out, const std::string& path, Proto proto) {
     std::ifstream f(path);
     if (!f) return;
 
@@ -227,11 +337,10 @@ void NetworkMonitor::parse_connections(const std::string& path, Proto proto) {
     while (std::getline(f, line)) {
         std::istringstream ss(line);
         std::string sl, local, remote, state_hex, skip;
-        uint64_t inode_val;
-        // Fields: sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode
+        uint64_t inode_val = 0;
         ss >> sl >> local >> remote >> state_hex;
-        for (int i = 0; i < 4; ++i) ss >> skip; // tx_queue:... tr:... retrnsmt uid
-        ss >> skip; // timeout
+        for (int i = 0; i < 4; ++i) ss >> skip;
+        ss >> skip;
         ss >> inode_val;
 
         auto colon_l = local.find(':');
@@ -245,6 +354,8 @@ void NetworkMonitor::parse_connections(const std::string& path, Proto proto) {
         c.remote_addr = hex_to_ip(remote.substr(0, colon_r), ipv6);
         c.remote_port = hex_to_port(remote.substr(colon_r + 1));
         c.state       = hex_to_state(state_hex);
+        c.inode       = inode_val;
+        c.pid         = -1;
 
         auto it = inode_to_pid_.find(inode_val);
         if (it != inode_to_pid_.end()) {
@@ -253,7 +364,7 @@ void NetworkMonitor::parse_connections(const std::string& path, Proto proto) {
             if (nit != pid_to_name_.end()) c.process_name = nit->second;
         }
 
-        conns_.push_back(c);
+        out.push_back(c);
     }
 }
 
@@ -279,21 +390,57 @@ std::vector<Connection> NetworkMonitor::new_listening_ports() const {
 
 std::vector<Connection> NetworkMonitor::closed_connections() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    // Find ESTABLISHED connections from prev that are gone now
     std::vector<Connection> v;
     for (const auto& prev : prev_conns_) {
         if (prev.state != ConnState::ESTABLISHED) continue;
         bool found = false;
         for (const auto& curr : conns_) {
-            if (curr.local_addr  == prev.local_addr  &&
-                curr.local_port  == prev.local_port  &&
-                curr.remote_addr == prev.remote_addr &&
-                curr.remote_port == prev.remote_port)
-            { found = true; break; }
+            if (same_tuple(curr, prev)) { found = true; break; }
         }
         if (!found) v.push_back(prev);
     }
     return v;
+}
+
+std::vector<BurstAlert> NetworkMonitor::detect_bursts(int count_threshold, int window_secs) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<BurstAlert> out;
+    if (count_threshold <= 0 || window_secs <= 0) return out;
+    auto now = std::chrono::system_clock::now();
+    auto window = std::chrono::seconds(window_secs);
+
+    struct Key { std::string addr; uint16_t port; int pid; };
+    struct Rec { int count = 0; std::string name; bool known = false; };
+    std::map<std::string, Rec> buckets;
+
+    for (const auto& ch : timeline_) {
+        if (ch.type != ConnChangeType::NEW_ESTABLISHED) continue;
+        if (now - ch.timestamp > window) continue;
+        std::string k = ch.conn.remote_addr + "|" + std::to_string(ch.conn.remote_port) +
+                        "|" + std::to_string(ch.conn.pid);
+        auto& rec = buckets[k];
+        rec.count++;
+        rec.name = ch.conn.process_name;
+        rec.known = ch.conn.owner_known();
+    }
+    for (const auto& [k, rec] : buckets) {
+        if (rec.count < count_threshold) continue;
+        BurstAlert b;
+        auto c1 = k.rfind('|');
+        auto c2 = k.rfind('|', c1 - 1);
+        if (c1 == std::string::npos || c2 == std::string::npos) continue;
+        try {
+            b.pid = std::stoi(k.substr(c1 + 1));
+            b.remote_port = static_cast<uint16_t>(std::stoi(k.substr(c2 + 1, c1 - c2 - 1)));
+            b.remote_addr = k.substr(0, c2);
+        } catch (...) { continue; }
+        b.count = rec.count;
+        b.window_secs = window_secs;
+        b.process_name = rec.name;
+        b.owner_known = rec.known;
+        out.push_back(b);
+    }
+    return out;
 }
 
 } // namespace net

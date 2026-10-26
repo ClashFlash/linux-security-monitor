@@ -6,6 +6,7 @@
 #include "file_integrity.hpp"
 #include "security_rules.hpp"
 #include "event_system.hpp"
+#include "incident.hpp"
 #include "ui.hpp"
 #include "alert.hpp"
 #include "config.hpp"
@@ -64,6 +65,13 @@ int main(int argc, char** argv) {
     // ── Event log ──────────────────────────────────────────────────────────
     auto event_log = std::make_shared<events::EventLog>(cfg.event_log_path);
 
+    // ── Incident store ─────────────────────────────────────────────────────
+    auto incident_store = std::make_shared<incidents::IncidentStore>(cfg.incidents_path);
+    // Feed every event into the incident correlator
+    event_log->on_event([&](const events::Event& e) {
+        incident_store->ingest(e);
+    });
+
     // ── Alerter ────────────────────────────────────────────────────────────
     alert::Thresholds thr;
     thr.terminal_bell          = cfg.terminal_bell;
@@ -93,7 +101,7 @@ int main(int argc, char** argv) {
     cpu::CpuMonitor    cpu_mon;
     mem::MemoryMonitor mem_mon;
     proc::ProcessMonitor proc_mon;
-    net::NetworkMonitor  net_mon;
+    net::NetworkMonitor  net_mon(cfg.trusted_ports_path);
 
     // Initial data: take first baseline snapshot, wait briefly, then refresh
     // so delta calculations (CPU%, process CPU, network rates) have non-zero deltas on launch
@@ -109,11 +117,11 @@ int main(int argc, char** argv) {
     // ── Background threads ─────────────────────────────────────────────────
 
     // 1. SSH monitor thread
-    ssh::SshMonitor ssh_mon(event_log, cfg.ssh_fail_threshold, cfg.ssh_fail_window_secs);
+    ssh::SshMonitor ssh_mon(event_log, cfg.ssh_thresholds(), cfg.known_auth_ips_path);
     ssh_mon.start();
 
     // 2. File integrity monitor thread
-    integrity::FileIntegrityMonitor file_mon(event_log, cfg.monitored_paths);
+    integrity::FileIntegrityMonitor file_mon(event_log, cfg.monitored_paths, cfg.file_baseline_path);
     file_mon.start();
 
     // 3. Data collection + security engine thread (2s cycle)
@@ -172,6 +180,37 @@ int main(int argc, char** argv) {
                     ++it;
             }
 
+            // Emit events for connection bursts
+            auto bursts = net_mon.detect_bursts(cfg.conn_burst_count, cfg.conn_burst_window);
+            for (const auto& b : bursts) {
+                std::string key = "net:burst:" + b.remote_addr + ":" + std::to_string(b.remote_port);
+                event_log->push({
+                    std::chrono::system_clock::now(),
+                    events::Category::NETWORK,
+                    events::Severity::HIGH,
+                    "network",
+                    "Connection burst detected",
+                    std::string("Repeated connection attempts to ") + b.remote_addr +
+                        ":" + std::to_string(b.remote_port) +
+                        " (" + std::to_string(b.count) + " in " +
+                        std::to_string(b.window_secs) + "s)" +
+                        (b.owner_known ? " by " + b.process_name + " (pid=" +
+                                         std::to_string(b.pid) + ")" : " (owner unknown)"),
+                    "",         // id
+                    key,        // grouping_key
+                    "Repeated outbound connection attempts can indicate scanning, beaconing, or C2 communication.",
+                    "remote=" + b.remote_addr + ":" + std::to_string(b.remote_port) +
+                        " count=" + std::to_string(b.count) + " window=" +
+                        std::to_string(b.window_secs) + "s pid=" + std::to_string(b.pid),
+                    "Identify the remote host; confirm whether this is expected traffic (update, backup, monitoring); otherwise block or investigate.",
+                    b.pid,      // pid
+                    -1,         // ppid
+                    "",         // exe_path
+                    "",         // username
+                    b.remote_addr + ":" + std::to_string(b.remote_port) // extra
+                });
+            }
+
             data_updated = true;
 
             std::unique_lock<std::mutex> lk(g_shutdown_mutex);
@@ -216,6 +255,8 @@ int main(int argc, char** argv) {
 
             ui::DisplayData dd{
                 &cpu_mon, &mem_mon, &proc_mon, &net_mon, event_log.get(),
+                &ssh_mon, &file_mon, incident_store.get(),
+                cfg.reports_dir,
                 sorted, conns_snapshot
             };
 
@@ -231,7 +272,7 @@ int main(int argc, char** argv) {
             if (sel > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
                 int key = term.get_key();
                 while (key != -1) {
-                    term.handle_key(ui_state, key, sorted, proc_mon);
+                    term.handle_key(ui_state, key, dd);
                     key = term.get_key();
                 }
             }

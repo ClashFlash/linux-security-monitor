@@ -6,6 +6,7 @@
 #include "ssh_monitor.hpp"
 #include "file_integrity.hpp"
 #include "event_system.hpp"
+#include "incident.hpp"
 #include <string>
 #include <vector>
 #include <memory>
@@ -13,42 +14,57 @@
 
 namespace ui {
 
-enum class Panel { PROCESSES, NETWORK, EVENTS, HELP };
+enum class Panel { PROCESSES, NETWORK, AUTH, EVENTS, INCIDENTS, HELP };
 
 enum class EventFilter { ALL, AUTH, PROCESS, NETWORK, FILE, SYSTEM };
+
+enum class ConfirmAction { NONE, KILL_PROCESS, REBASE };
 
 struct UiState {
     Panel       active_panel     = Panel::PROCESSES;
 
-    // Process panel
     int         proc_selected    = 0;
     proc::SortField proc_sort    = proc::SortField::CPU;
     std::string proc_search;
     bool        proc_searching   = false;
-    bool        proc_detail      = false;    // showing detail screen
+    bool        proc_detail      = false;
 
-    // Events panel
     EventFilter event_filter     = EventFilter::ALL;
     int         event_scroll     = 0;
+    int         event_selected   = 0;
+    bool        event_detail     = false;
     std::string event_search;
     bool        event_searching  = false;
 
-    // Network panel
     int         net_scroll       = 0;
+    int         net_selected     = 0;
+    bool        net_show_timeline = false;
 
-    // Help panel
+    int         auth_selected    = 0;
+    int         auth_scroll      = 0;
+
+    int         inc_selected     = 0;
+    int         inc_scroll       = 0;
+    bool        inc_detail       = false;
+
     int         help_scroll      = 0;
 
+    ConfirmAction confirm        = ConfirmAction::NONE;
+    int           confirm_pid    = -1;
+    std::string   status_message;
     bool        quit             = false;
 };
 
 struct DisplayData {
-    cpu::CpuMonitor*                        cpu;
-    mem::MemoryMonitor*                     mem;
-    proc::ProcessMonitor*                   procs;
-    net::NetworkMonitor*                    net;
-    events::EventLog*                       events;
-    // for detail screen
+    cpu::CpuMonitor*                        cpu = nullptr;
+    mem::MemoryMonitor*                     mem = nullptr;
+    proc::ProcessMonitor*                   procs = nullptr;
+    net::NetworkMonitor*                    net = nullptr;
+    events::EventLog*                       events = nullptr;
+    ssh::SshMonitor*                        ssh = nullptr;
+    integrity::FileIntegrityMonitor*        files = nullptr;
+    incidents::IncidentStore*               incidents = nullptr;
+    std::filesystem::path                   reports_dir;
     std::vector<const proc::ProcessInfo*>   sorted_procs;
     std::vector<net::Connection>            connections;
 };
@@ -58,15 +74,11 @@ public:
     Terminal();
     ~Terminal();
 
-    // Draw full screen — call each frame
     void draw(const DisplayData& data, const UiState& state);
 
-    // Handle a keypress — updates state, returns true to keep running
-    bool handle_key(UiState& state, int key,
-                    const std::vector<const proc::ProcessInfo*>& procs,
-                    proc::ProcessMonitor& pm);
+    bool handle_key(UiState& state, int key, DisplayData& data);
 
-    int  get_key();           // non-blocking: returns -1 if no key
+    int  get_key();
     void get_terminal_size(int& rows, int& cols);
 
 private:
@@ -75,18 +87,23 @@ private:
     void draw_tab_bar(const UiState& state, int cols);
     void draw_processes(const DisplayData& d, const UiState& state,
                         int top_row, int rows, int cols);
-    void draw_process_detail(const proc::ProcessInfo& p, int rows, int cols);
+    void draw_process_detail(const proc::ProcessInfo& p, const DisplayData& d,
+                             int rows, int cols);
     void draw_network(const DisplayData& d, const UiState& state,
                       int top_row, int rows, int cols);
+    void draw_auth(const DisplayData& d, const UiState& state,
+                   int top_row, int rows, int cols);
     void draw_events(const DisplayData& d, const UiState& state,
                      int top_row, int rows, int cols);
+    void draw_event_detail(const events::Event& e, int rows, int cols);
+    void draw_incidents(const DisplayData& d, const UiState& state,
+                        int top_row, int rows, int cols);
+    void draw_incident_detail(const incidents::Incident& inc, int rows, int cols);
     void draw_help(const UiState& state, int top_row, int rows, int cols);
     void draw_footer(const UiState& state, int cols);
+    void draw_confirm(const UiState& state, int cols);
 
-    // ASCII progress bar: e.g. [████░░░░] 42%
     static std::string progress_bar(float pct, int width);
-
-    // ANSI helpers
     static void set_cursor(int row, int col);
     static void clear_screen();
     static void color(int ansi_code);

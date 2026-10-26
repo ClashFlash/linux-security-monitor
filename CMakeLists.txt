@@ -37,6 +37,7 @@ set(MONITOR_SOURCES
   src/ui.cpp
   src/alert.cpp
   src/config.cpp
+  src/incident.cpp
 )
 
 # ── Library (used by both the binary and the tests) ───────────────────────────
