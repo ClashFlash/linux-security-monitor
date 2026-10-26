@@ -118,33 +118,40 @@ sound_enabled=true
 notify_enabled=true
 ```
 
-## Architecture
+## Architecture & Concurrency
 
 ```
-main.cpp                  — thin wiring: starts threads, runs UI loop
-├── cpu.{hpp,cpp}         — /proc/stat → CPU%
-├── memory.{hpp,cpp}      — /proc/meminfo → RAM stats
-├── process.{hpp,cpp}     — /proc/*/stat → process table with CPU delta
-├── network.{hpp,cpp}     — /proc/net/tcp* + /proc/PID/fd → connections
-├── ssh_monitor.{hpp,cpp} — tail auth.log + journalctl, regex parsing
-├── file_integrity.*      — SHA-256 baseline, change detection
-├── security_rules.*      — pure-function rule evaluators + SecurityEngine
-├── event_system.*        — thread-safe ring buffer + JSON log
-├── alert.*               — bell + notify-send alerter
-├── config.*              — load monitored_files.conf + thresholds.conf
-└── ui.*                  — raw terminal TUI, keyboard input, all panels
+main.cpp                  — Startup orchestration, signal handling & synchronized teardown
+├── cpu.{hpp,cpp}         — /proc/stat parser: delta-based CPU% & per-core utilization
+├── memory.{hpp,cpp}      — /proc/meminfo parser: RAM usage, buffers, and swap
+├── process.{hpp,cpp}     — /proc/*/stat & /proc/*/status: thread-safe process cache & sorting
+├── network.{hpp,cpp}     — /proc/net/tcp*, udp*, /proc/net/dev, socket inode resolver
+├── ssh_monitor.{hpp,cpp} — Real-time auth.log / journalctl watcher with regex event extraction
+├── file_integrity.*      — Incremental multi-threaded SHA-256 baseline & anomaly detection
+├── security_rules.*      — Pure-function security rules engine & event deduplicator
+├── event_system.*        — Thread-safe ring buffer (1000 events) + persistent JSONL logging
+├── alert.*               — Rate-limited terminal bell & async notify-send desktop alerts
+├── config.*              — Robust INI/conf parser with aliases, comments, and whitespace trimming
+└── ui.*                  — High-performance ANSI raw TUI dashboard with select-based event loop
 ```
 
-## Testing
+### Concurrency & Reliability Highlights
+- **Thread-safe State Snapshots:** The UI event loop operates on local thread-safe snapshots (`procs_snapshot`, `conns_snapshot`) to prevent race conditions during live sorting, filtering, and detail inspection.
+- **Responsive I/O Multiplexing:** Input handling leverages POSIX `select()` on `STDIN_FILENO` with a 50ms polling slice, guaranteeing immediate keystroke responsiveness without stalling background monitoring threads.
+- **Clean Signal Teardown:** Condition variable notifications (`g_shutdown_cv`) ensure background worker threads terminate immediately on `SIGINT`/`SIGTERM` without blocking during sleep cycles.
+- **Port Alert Deduplication:** Dynamic tracking of newly bound listening sockets alerts once upon detection and resets when unbound, preventing notification spam.
 
-61 unit tests covering:
-- CPU% calculation with synthetic /proc/stat deltas
-- SSH auth.log line parser (7 test cases, regex edge cases)
-- File integrity: SHA-256 known vectors, modification/creation/deletion detection
-- Security rules: all 6 rules with positive and negative cases + deduplication
-- Network hex parser: IP/port conversion with known values
-- Process monitor: PID/CPU/Memory sorting, process details, filtering, and caching
-- Configuration loader: threshold settings, aliases, comments, and whitespace trimming
+## Testing & Quality Assurance
+
+A comprehensive GoogleTest suite with **61 unit tests** ensures detection accuracy and engine stability across edge cases:
+
+- **CPU Monitor (7 tests):** Delta CPU usage math, core calculations, and crash resilience on malformed procfs data.
+- **SSH Parser (8 tests):** Failed password patterns, invalid user accounts, combined failures, accepted password/public-key logins, IPv4 and IPv6 source addresses, and empty/unrelated log lines.
+- **File Integrity Monitor (9 tests):** SHA-256 known RFC test vectors, modification, creation, deletion detections, and event emissions.
+- **Security Rules Engine (15 tests):** Execution from `/tmp`, `/dev/shm`, and `/run/user`, deleted running executables, critical alerts for root executions, newly opened listening ports, suspicious outbound connections, and alert deduplication.
+- **Network Hex Parser (13 tests):** Hex-to-IPv4 conversions (loopback, private, broadcast, zeros), port endian conversions (HTTP, HTTPS, SSH, edge values), `/proc/net/tcp` parsing, interface traffic, and connection state checks.
+- **Process Monitor (6 tests):** Process enumeration, sorting by PID/CPU/Memory, regex/substring search filters, and file descriptor detail extraction.
+- **Configuration Engine (3 tests):** Default fallback guarantees, alias normalization, whitespace handling, and comment stripping in configuration files.
 
 ```bash
 make test
