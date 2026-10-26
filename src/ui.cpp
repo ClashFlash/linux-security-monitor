@@ -300,7 +300,7 @@ void Terminal::draw_header(const cpu::CpuMonitor& cpu,
     float mem_pct = mi.used_pct();
     std::string mem_color = mem_pct > 80 ? ANSI_BRED : mem_pct > 60 ? ANSI_BYELLOW : ANSI_BGREEN;
     std::string mem_bar = progress_bar(mem_pct, 20);
-    std::string mem_str = std::to_string(mi.used_mb()) + " / " + std::to_string(mi.total_mb()) + " MB";
+    std::string mem_str = std::to_string(mi.used_mib()) + " / " + std::to_string(mi.total_mib()) + " MiB";
 
     set_cursor(1, 1);
     printf(ANSI_BOLD ANSI_BCYAN " Linux Security Monitor" ANSI_RESET "%s", ANSI_CLEAR_LINE);
@@ -373,7 +373,7 @@ void Terminal::draw_processes(const DisplayData& d, const UiState& state,
     // Header
     set_cursor(top_row, 1);
     printf(ANSI_BOLD ANSI_BCYAN
-           "%-7s %-7s %-10s %-6s %-6s %-2s %-20s %-*s %s" ANSI_RESET "%s\n",
+           "%-7s %-7s %-10s %6s %6s %-3s %-20s %-*s %s" ANSI_RESET "%s\n",
            "PID", "PPID", "USER", "CPU%", "MEM%", "S",
            "COMMAND", exe_col_width, "EXE PATH", "STARTED", ANSI_CLEAR_LINE);
 
@@ -418,8 +418,8 @@ void Terminal::draw_processes(const DisplayData& d, const UiState& state,
             : p->exe_path;
 
         if (selected) {
-            // High contrast text inside selection bar
-            printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %c  %-20s %-*s %s",
+            // High contrast text inside selection bar, perfectly aligned
+            printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %-3c %-20s %-*s %s",
                    p->pid, p->ppid,
                    trunc(p->username, 10).c_str(),
                    p->cpu_pct, p->mem_pct,
@@ -428,7 +428,8 @@ void Terminal::draw_processes(const DisplayData& d, const UiState& state,
                    exe_col_width, trunc(short_exe, exe_col_width).c_str(),
                    p->start_time_str.c_str());
         } else {
-            printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %s%c" ANSI_RESET "%s %-20s %-*s %s",
+            // Non-selected row: print fields matching exact header column widths
+            printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %s%-3c" ANSI_RESET "%s%-20s %-*s %s",
                    p->pid, p->ppid,
                    trunc(p->username, 10).c_str(),
                    p->cpu_pct, p->mem_pct,
@@ -468,7 +469,7 @@ void Terminal::draw_process_detail(const proc::ProcessInfo& p, int rows, int col
     line("User:",      p.username + " (uid=" + std::to_string(p.uid) + ")");
     line("State:",     std::string(1, static_cast<char>(p.state)));
     line("CPU%:",      std::to_string(p.cpu_pct).substr(0, 5) + "%");
-    line("Memory%:",   std::to_string(p.mem_pct).substr(0, 5) + "% (" + std::to_string(p.rss_kb / 1024) + " MB)");
+    line("Memory%:",   std::to_string(p.mem_pct).substr(0, 5) + "% (" + std::to_string(p.rss_kb / 1024) + " MiB)");
     line("Name:",      p.name);
     int cmd_width = std::max(10, cols - 20);
     line("Cmdline:",   trunc(p.cmdline, cmd_width));
@@ -505,7 +506,7 @@ void Terminal::draw_network(const DisplayData& d, const UiState& state,
     }
 
     printf("\n" ANSI_BOLD ANSI_BCYAN " ── Connections ─────────────────────────" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
-    printf(ANSI_BOLD "%-6s %-22s %-22s %-12s %-6s %-15s" ANSI_RESET "%s\n",
+    printf(ANSI_BOLD "%-7s %-22s %-22s %-13s %-7s %-15s" ANSI_RESET "%s\n",
            "PROTO", "LOCAL", "REMOTE", "STATE", "PID", "PROCESS", ANSI_CLEAR_LINE);
 
     int line = 0;
@@ -519,11 +520,11 @@ void Terminal::draw_network(const DisplayData& d, const UiState& state,
             c.state == net::ConnState::LISTEN      ? ANSI_CYAN  :
             c.state == net::ConnState::TIME_WAIT   ? ANSI_YELLOW : ANSI_RESET;
 
-        printf("%s%-6s%s %-22s %-22s %s%-12s%s %-6d %-15s%s\n",
-               ANSI_DIM, c.proto_str().c_str(), ANSI_RESET,
-               (c.local_addr + ":" + std::to_string(c.local_port)).c_str(),
-               (c.remote_addr + ":" + std::to_string(c.remote_port)).c_str(),
-               state_col, c.state_str().c_str(), ANSI_RESET,
+        printf("%s%-7s" ANSI_RESET " %-22s %-22s %s%-13s" ANSI_RESET " %-7d %-15s%s\n",
+               ANSI_DIM, trunc(c.proto_str(), 7).c_str(),
+               trunc(c.local_addr + ":" + std::to_string(c.local_port), 22).c_str(),
+               trunc(c.remote_addr + ":" + std::to_string(c.remote_port), 22).c_str(),
+               state_col, trunc(c.state_str(), 13).c_str(),
                c.pid,
                trunc(c.process_name, 15).c_str(), ANSI_CLEAR_LINE);
     }

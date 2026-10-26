@@ -16,12 +16,19 @@ struct MemInfo {
     float used_pct()      const;
     float swap_used_pct() const;
 
-    // Convenience: MB values
-    uint64_t total_mb()    const { return total_kb    / 1024; }
-    uint64_t used_mb()     const { return used_kb     / 1024; }
-    uint64_t available_mb()const { return available_kb/ 1024; }
-    uint64_t swap_total_mb()const{ return swap_total_kb/1024; }
-    uint64_t swap_used_mb() const{ return swap_used_kb /1024; }
+    // Convenience: MiB values (1 MiB = 1024 KiB)
+    uint64_t total_mib()    const { return total_kb    / 1024; }
+    uint64_t used_mib()     const { return used_kb     / 1024; }
+    uint64_t available_mib()const { return available_kb/ 1024; }
+    uint64_t swap_total_mib()const{ return swap_total_kb/1024; }
+    uint64_t swap_used_mib() const{ return swap_used_kb /1024; }
+
+    // Backward-compatible MB aliases
+    uint64_t total_mb()    const { return total_mib(); }
+    uint64_t used_mb()     const { return used_mib(); }
+    uint64_t available_mb()const { return available_mib(); }
+    uint64_t swap_total_mb()const{ return swap_total_mib(); }
+    uint64_t swap_used_mb() const{ return swap_used_mib(); }
 };
 
 class MemoryMonitor {

@@ -95,7 +95,9 @@ int main(int argc, char** argv) {
     proc::ProcessMonitor proc_mon;
     net::NetworkMonitor  net_mon;
 
-    // Initial data
+    // Initial data: take first baseline snapshot, wait briefly, then refresh
+    // so delta calculations (CPU%, process CPU, network rates) have non-zero deltas on launch
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     cpu_mon.refresh();
     mem_mon.refresh();
     proc_mon.refresh();
