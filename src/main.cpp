@@ -227,7 +227,8 @@ int main(int argc, char** argv) {
         std::vector<net::Connection>   conns_snapshot = net_mon.connections();
 
         while (g_running && !ui_state.quit) {
-            if (data_updated.exchange(false)) {
+            bool data_changed = data_updated.exchange(false);
+            if (data_changed) {
                 procs_snapshot = proc_mon.processes();
                 conns_snapshot = net_mon.connections();
             }
@@ -260,7 +261,10 @@ int main(int argc, char** argv) {
                 sorted, conns_snapshot
             };
 
-            term.draw(dd, ui_state);
+            // Only redraw when data changed or a key was pressed to avoid flicker.
+            // The incidents panel calls snapshot() (a mutex-locked copy) every cycle,
+            // so gating on actual change prevents spurious full-screen redraws.
+            bool key_pressed = false;
 
             // Wait for keypress or timeout (50ms) using select
             fd_set fds;
@@ -274,7 +278,12 @@ int main(int argc, char** argv) {
                 while (key != -1) {
                     term.handle_key(ui_state, key, dd);
                     key = term.get_key();
+                    key_pressed = true;
                 }
+            }
+
+            if (data_changed || key_pressed) {
+                term.draw(dd, ui_state);
             }
         }
     } // Terminal destructor restores terminal

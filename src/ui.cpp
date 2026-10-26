@@ -924,7 +924,10 @@ void Terminal::draw_incidents(const DisplayData& d, const UiState& state,
         const auto& inc = list[i];
         bool selected   = i == state.inc_selected;
 
-        const char* sev_col = severity_color(inc.max_severity).c_str();
+        // Store in local variables — severity_color() returns a temporary std::string,
+        // so calling .c_str() inline produces a dangling pointer and stray characters.
+        std::string sev_col_str = severity_color(inc.max_severity);
+        const char* sev_col = sev_col_str.c_str();
         const char* stat_col =
             inc.status == incidents::Status::OPEN           ? ANSI_BRED :
             inc.status == incidents::Status::ACKNOWLEDGED   ? ANSI_BYELLOW :
@@ -1002,8 +1005,10 @@ void Terminal::draw_incident_detail(const incidents::Incident& inc, int rows, in
         printf(ANSI_BOLD "\n Recent evidence:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
         for (int i = ev_count - show_ev; i < ev_count; ++i) {
             const auto& e = inc.evidence_events[i];
+            // Store severity color in a local — temporary std::string::c_str() is dangling.
+            std::string ev_col_str = severity_color(e.severity);
             printf("  %s[%s] %s %s%s" ANSI_RESET " %s%s\n",
-                   severity_color(e.severity).c_str(),
+                   ev_col_str.c_str(),
                    e.timestamp_str().c_str(),
                    e.severity_str().c_str(),
                    e.category_str().c_str(),
@@ -1095,8 +1100,10 @@ void Terminal::draw_events(const DisplayData& d, const UiState& state,
                    trunc(e.title, title_width).c_str(),
                    ANSI_CLEAR_LINE);
         } else {
+            // Store locally — temporary std::string::c_str() is dangling in printf args.
+            std::string ev_row_col = severity_color(e.severity);
             printf("%s%-20s " ANSI_RESET "%-8s " ANSI_DIM "%-9s %-12s" ANSI_RESET " %s%s\n",
-                   severity_color(e.severity).c_str(),
+                   ev_row_col.c_str(),
                    e.timestamp_str().c_str(),
                    e.severity_str().c_str(),
                    e.category_str().c_str(),
@@ -1120,7 +1127,7 @@ void Terminal::draw_help(const UiState& state, int top_row, int rows, int cols) 
 
     const char* guide[] = {
         ANSI_BOLD ANSI_BYELLOW "[1] GLOBAL CONTROLS & SHORTCUTS" ANSI_RESET,
-        "  TAB / 1-4    Switch active panel (1:Processes, 2:Network, 3:Events, 4:Help)",
+        "  TAB / 1-5    Switch active panel (1:Processes, 2:Network, 3:Events, 4:Incidents, 5:Help)",
         "  q / Q        Gracefully terminate and restore terminal",
         "  h / 4        Open this reference guide",
         "  ↑ ↓ / j k    Navigate or scroll active tables and event lists",
@@ -1186,6 +1193,65 @@ void Terminal::draw_help(const UiState& state, int top_row, int rows, int cols) 
         "",
         "  Severity Levels:",
         "    " ANSI_BGREEN "LOW" ANSI_RESET " / " ANSI_BYELLOW "MEDIUM" ANSI_RESET " / " ANSI_RED "HIGH" ANSI_RESET " / " ANSI_BRED "CRITICAL" ANSI_RESET " (Emits desktop alert & terminal bell)",
+        "",
+        ANSI_BOLD ANSI_BYELLOW "[5] INCIDENTS PANEL (key 5)" ANSI_RESET,
+        "  Overview List Keys:",
+        "    ↑ ↓ / j k    Navigate the incident list",
+        "    Enter        Open incident detail view",
+        "    a            Acknowledge the selected incident (mark seen)",
+        "    i            Set status to Investigating",
+        "    r            Mark incident Resolved",
+        "    e            Export full incident report to disk (reports/ directory)",
+        "    x            Send SIGTERM to the incident's related PID (confirmation required)",
+        "    ESC          Return from detail view to the incident list",
+        "",
+        "  Incident Lifecycle:",
+        "    OPEN → ACKNOWLEDGED → INVESTIGATING → RESOLVED",
+        "    Each status change is persisted to disk and survives restarts.",
+        "    Resolved incidents remain in the list for audit purposes.",
+        "",
+        ANSI_BOLD ANSI_BYELLOW "[6] BURST DETECTION (NETWORK ANOMALY)" ANSI_RESET,
+        "  Burst detection watches for sudden spikes in connection activity:",
+        "    • A burst is triggered when a process opens more connections than the",
+        "      configured threshold within a single monitoring interval.",
+        "    • Bursts are emitted as NETWORK/HIGH events and automatically create",
+        "      or update an Incident grouped by the owning process's PID.",
+        "    • Trusted ports (marked with 't' on the Network panel) are excluded.",
+        "",
+        "  Investigating a burst:",
+        "    1. Check the Incidents panel (key 5) for grouped burst alerts.",
+        "    2. Open the incident detail to see first/last seen, related PID, path.",
+        "    3. Use the Events panel (key 3) and filter by NET to see per-event detail.",
+        "    4. If the process is expected (e.g. a backup tool), mark the incident Resolved.",
+        "",
+        ANSI_BOLD ANSI_BYELLOW "[7] INCIDENT INGESTION (EVENT → INCIDENT PIPELINE)" ANSI_RESET,
+        "  Every security event is evaluated against the IncidentStore for grouping:",
+        "    • Events sharing a group key (PID, source IP, file path, or port) are",
+        "      merged into a single Incident rather than flooding the list.",
+        "    • The incident's severity is promoted if a new event is more severe.",
+        "    • Incidents persist across restarts in ~/.local/share/linux-security-monitor/",
+        "",
+        "  Group keys by category:",
+        "    AUTH     Grouped by source IP address",
+        "    PROCESS  Grouped by PID (or executable path for ephemeral processes)",
+        "    NETWORK  Grouped by port number (listening) or remote IP (outbound)",
+        "    FILE     Grouped by absolute file path",
+        "    SYSTEM   Grouped by event title",
+        "",
+        ANSI_BOLD ANSI_BYELLOW "[8] PROCESS PARENT-CHAIN ANALYSIS" ANSI_RESET,
+        "  The security engine walks the process tree to detect anomalous spawn chains:",
+        "    • A service process (nginx, sshd, httpd, etc.) that spawns an interactive",
+        "      shell (bash, sh, zsh, python, perl, ruby) triggers a HIGH alert.",
+        "    • The alert records: suspicious PID, parent PID, parent name, executable",
+        "      path, owning user, start time, and any associated open connections.",
+        "    • Each finding is annotated with a human-readable reason explaining why",
+        "      the parent-child relationship is unusual.",
+        "",
+        "  Interpreting a parent-chain alert:",
+        "    • It means a service that normally has no interactive children has one.",
+        "    • This is a known pattern for web-shell exploitation and SSH pivoting.",
+        "    • It is an indicator, not proof: verify the process in the detail view",
+        "      (Enter on the Processes panel) and check its command line and connections.",
         nullptr
     };
 
