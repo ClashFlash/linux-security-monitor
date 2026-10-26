@@ -17,6 +17,8 @@ namespace proc {
 ProcessMonitor::ProcessMonitor() {
     tick_hz_ = static_cast<double>(sysconf(_SC_CLK_TCK));
     if (tick_hz_ <= 0) tick_hz_ = 100.0;
+    long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+    num_cores_ = (nprocs > 0) ? static_cast<int>(nprocs) : 1;
 
     // Read boot time from /proc/stat
     std::ifstream f("/proc/stat");
@@ -160,14 +162,14 @@ void ProcessMonitor::read_stat(ProcessInfo& p, const Snapshot* prev,
     p.state = static_cast<ProcState>(state_c);
     p.rss_kb = rss * 4; // pages -> KB (assume 4K pages)
 
-    // CPU%
+    // CPU% (top-style per-core normalization: 100% means 1 full core utilized)
     if (prev && cpu_delta > 0) {
         uint64_t prev_proc = prev->utime + prev->stime;
         uint64_t curr_proc = utime + stime;
         if (curr_proc > prev_proc) {
             uint64_t proc_delta = curr_proc - prev_proc;
-            p.cpu_pct = static_cast<float>(proc_delta) /
-                        static_cast<float>(cpu_delta) * 100.f;
+            p.cpu_pct = (static_cast<float>(proc_delta) /
+                         static_cast<float>(cpu_delta) * 100.f) * static_cast<float>(num_cores_);
         }
     }
 

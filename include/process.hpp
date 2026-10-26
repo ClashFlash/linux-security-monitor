@@ -72,6 +72,7 @@ private:
     std::unordered_map<int, Snapshot> prev_;
     uint64_t                          prev_total_cpu_ = 0;
     double                            tick_hz_        = 100.0;
+    int                               num_cores_      = 1;
     uint64_t                          boot_time_      = 0; // epoch seconds
     mutable std::unordered_map<uid_t, std::string> username_cache_;
 

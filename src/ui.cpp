@@ -367,14 +367,25 @@ void Terminal::draw_processes(const DisplayData& d, const UiState& state,
                                int top_row, int rows, int cols)
 {
     const auto& sorted = d.sorted_procs;
+    auto fmt_mem = [](uint64_t kb) -> std::string {
+        if (kb >= 1048576) {
+            char b[16];
+            snprintf(b, sizeof(b), "%.1fG", static_cast<double>(kb) / 1048576.0);
+            return b;
+        } else if (kb >= 1024) {
+            return std::to_string(kb / 1024) + "M";
+        } else {
+            return std::to_string(kb) + "K";
+        }
+    };
 
-    int exe_col_width = std::max(10, cols - 65);
+    int exe_col_width = std::max(10, cols - 66);
 
     // Header
     set_cursor(top_row, 1);
     printf(ANSI_BOLD ANSI_BCYAN
-           "%-7s %-7s %-10s %6s %6s %-3s %-20s %-*s %s" ANSI_RESET "%s\n",
-           "PID", "PPID", "USER", "CPU%", "MEM%", "S",
+           "%-7s %-7s %-10s %6s %7s %-3s %-20s %-*s %s" ANSI_RESET "%s\n",
+           "PID", "PPID", "USER", "CPU%", "MEM", "S",
            "COMMAND", exe_col_width, "EXE PATH", "STARTED", ANSI_CLEAR_LINE);
 
     // Search bar
@@ -419,20 +430,20 @@ void Terminal::draw_processes(const DisplayData& d, const UiState& state,
 
         if (selected) {
             // High contrast text inside selection bar, perfectly aligned
-            printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %-3c %-20s %-*s %s",
+            printf("%-7d %-7d %-10s %5.1f%% %7s %-3c %-20s %-*s %s",
                    p->pid, p->ppid,
                    trunc(p->username, 10).c_str(),
-                   p->cpu_pct, p->mem_pct,
+                   p->cpu_pct, fmt_mem(p->rss_kb).c_str(),
                    state_c,
                    trunc(p->name, 20).c_str(),
                    exe_col_width, trunc(short_exe, exe_col_width).c_str(),
                    p->start_time_str.c_str());
         } else {
             // Non-selected row: print fields matching exact header column widths
-            printf("%-7d %-7d %-10s %5.1f%% %5.1f%% %s%-3c" ANSI_RESET "%s%-20s %-*s %s",
+            printf("%-7d %-7d %-10s %5.1f%% %7s %s%-3c" ANSI_RESET "%s%-20s %-*s %s",
                    p->pid, p->ppid,
                    trunc(p->username, 10).c_str(),
-                   p->cpu_pct, p->mem_pct,
+                   p->cpu_pct, fmt_mem(p->rss_kb).c_str(),
                    state_col, state_c, row_col,
                    trunc(p->name, 20).c_str(),
                    exe_col_width, trunc(short_exe, exe_col_width).c_str(),
