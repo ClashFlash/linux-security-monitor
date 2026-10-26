@@ -64,7 +64,7 @@ A real-time Linux security monitoring tool written in C++17. Displays CPU, memor
 
 ### Quick build
 ```bash
-git clone <repo>
+git clone https://github.com/ClashFlash/linux-security-monitor.git
 cd linux-security-monitor
 make debug      # Debug build with ASan/UBSan
 make release    # Optimized release build
