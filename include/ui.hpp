@@ -11,6 +11,7 @@
 #include <vector>
 #include <memory>
 #include <atomic>
+#include <chrono>
 
 namespace ui {
 
@@ -52,6 +53,7 @@ struct UiState {
     ConfirmAction confirm        = ConfirmAction::NONE;
     int           confirm_pid    = -1;
     std::string   status_message;
+    std::chrono::steady_clock::time_point status_message_time;
     bool        quit             = false;
 };
 

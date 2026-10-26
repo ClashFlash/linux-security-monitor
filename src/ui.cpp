@@ -167,6 +167,7 @@ bool Terminal::handle_key(UiState& state, int key, DisplayData& data)
             if (state.confirm == ConfirmAction::KILL_PROCESS && state.confirm_pid > 0) {
                 if (::kill(state.confirm_pid, SIGTERM) == 0) {
                     state.status_message = "Sent SIGTERM to PID " + std::to_string(state.confirm_pid);
+                    state.status_message_time = std::chrono::steady_clock::now();
                     if (data.events) {
                         events::Event e;
                         e.timestamp = std::chrono::system_clock::now();
@@ -184,10 +185,12 @@ bool Terminal::handle_key(UiState& state, int key, DisplayData& data)
                     }
                 } else {
                     state.status_message = "Failed to signal PID " + std::to_string(state.confirm_pid);
+                    state.status_message_time = std::chrono::steady_clock::now();
                 }
             } else if (state.confirm == ConfirmAction::REBASE && data.files) {
                 data.files->baseline();
                 state.status_message = "Integrity baseline re-established from current disk contents.";
+                state.status_message_time = std::chrono::steady_clock::now();
                 if (data.events) {
                     events::Event e;
                     e.timestamp = std::chrono::system_clock::now();
@@ -208,6 +211,7 @@ bool Terminal::handle_key(UiState& state, int key, DisplayData& data)
             state.confirm = ConfirmAction::NONE;
             state.confirm_pid = -1;
             state.status_message = "Action cancelled";
+            state.status_message_time = std::chrono::steady_clock::now();
             return true;
         }
         return true;
@@ -499,10 +503,20 @@ void Terminal::draw_tab_bar(const UiState& state, int cols) {
 
 // Helper: truncate string to width
 static std::string trunc(const std::string& s, int w) {
+    // Strip control characters (newlines, tabs, escape sequences) that break column layout.
+    std::string clean;
+    clean.reserve(s.size());
+    bool in_esc = false;
+    for (unsigned char c : s) {
+        if (in_esc) { if (c == 'm') in_esc = false; continue; }
+        if (c == '\033') { in_esc = true; continue; }
+        if (c < 32 || c == 127) continue; // strip control chars
+        clean += static_cast<char>(c);
+    }
     if (w <= 0) return "";
-    if (static_cast<int>(s.size()) <= w) return s;
-    if (w <= 3) return s.substr(0, w);
-    return s.substr(0, w - 3) + "...";
+    if (static_cast<int>(clean.size()) <= w) return clean;
+    if (w <= 3) return clean.substr(0, w);
+    return clean.substr(0, w - 3) + "...";
 }
 
 void Terminal::draw_processes(const DisplayData& d, const UiState& state,
@@ -1322,9 +1336,13 @@ void Terminal::draw_footer(const UiState& state, int cols) {
             break;
     }
     if (!state.status_message.empty()) {
-        std::string msg = "  [" + state.status_message + "]";
-        int pad = std::max(0, cols - static_cast<int>(footer.size()) - static_cast<int>(msg.size()));
-        footer += std::string(pad, ' ') + msg;
+        // Auto-hide after 3 seconds.
+        auto age = std::chrono::steady_clock::now() - state.status_message_time;
+        if (std::chrono::duration_cast<std::chrono::seconds>(age).count() < 3) {
+            std::string msg = "  [" + state.status_message + "]";
+            int pad = std::max(0, cols - static_cast<int>(footer.size()) - static_cast<int>(msg.size()));
+            footer += std::string(pad, ' ') + msg;
+        }
     }
     footer += std::string(std::max(0, cols - static_cast<int>(footer.size())), ' ');
     printf("%.*s" ANSI_RESET, cols, footer.c_str());

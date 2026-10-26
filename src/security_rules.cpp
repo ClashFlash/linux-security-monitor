@@ -89,7 +89,11 @@ static void fill_process_result(RuleResult& r, const proc::ProcessInfo& p,
     r.ppid         = p.ppid;
     r.exe_path     = p.exe_path;
     r.username     = p.username;
-    r.grouping_key = "proc:" + std::to_string(p.pid);
+    // Group by rule + canonical exe path so many processes with the same
+    // deleted/tmp executable merge into one incident instead of flooding the list.
+    // Fall back to pid only when exe_path is empty (rare ephemeral procs).
+    const std::string& key_path = p.exe_path.empty() ? std::to_string(p.pid) : p.exe_path;
+    r.grouping_key = "proc:" + r.rule_name + ":" + key_path;
     r.why_suspicious = why;
     r.next_steps   = next;
     std::ostringstream ev;
