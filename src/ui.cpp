@@ -368,15 +368,22 @@ void Terminal::draw_processes(const DisplayData& d, const UiState& state,
 {
     const auto& sorted = d.sorted_procs;
     auto fmt_mem = [](uint64_t kb) -> std::string {
-        if (kb >= 1048576) {
-            char b[16];
-            snprintf(b, sizeof(b), "%.1fG", static_cast<double>(kb) / 1048576.0);
-            return b;
-        } else if (kb >= 1024) {
-            return std::to_string(kb / 1024) + "M";
+        char b[16];
+        if (kb < 1000) {
+            snprintf(b, sizeof(b), "%luK", kb);
+        } else if (kb < 10000) {
+            snprintf(b, sizeof(b), "%.1fM", static_cast<double>(kb) / 1024.0);
+        } else if (kb < 1024 * 1000) {
+            snprintf(b, sizeof(b), "%luM", (kb + 512) / 1024);
         } else {
-            return std::to_string(kb) + "K";
+            double gb = static_cast<double>(kb) / (1024.0 * 1024.0);
+            if (gb < 10.0) {
+                snprintf(b, sizeof(b), "%.1fG", gb);
+            } else {
+                snprintf(b, sizeof(b), "%dG", static_cast<int>(gb + 0.5));
+            }
         }
+        return b;
     };
 
     int exe_col_width = std::max(10, cols - 66);

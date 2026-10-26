@@ -143,24 +143,38 @@ void ProcessMonitor::read_stat(ProcessInfo& p, const Snapshot* prev,
     p.name = line.substr(lp + 1, rp - lp - 1);
 
     std::istringstream ss(line.substr(rp + 2));
-    char state_c = '?';
-    int ppid = 0;
-    uint64_t skip = 0, utime = 0, stime = 0, starttime = 0;
-    uint64_t rss = 0;
+    std::vector<std::string> parts;
+    std::string tok;
+    while (ss >> tok) {
+        parts.push_back(tok);
+    }
+    if (parts.size() < 22) return;
 
-    ss >> state_c >> ppid;
-    for (int i = 0; i < 11; ++i) ss >> skip; // fields 5-15
-    ss >> utime >> stime;                    // fields 14,15
-    for (int i = 0; i < 6; ++i) ss >> skip;  // skip to starttime(22)
-    ss >> starttime;                         // field 22
-    ss >> skip >> rss;                       // vsize(23), rss(24)
+    // Field 3: state
+    char state_c = parts[0].empty() ? '?' : parts[0][0];
+    // Field 4: ppid
+    int ppid = 0;
+    try { ppid = std::stoi(parts[1]); } catch (...) {}
+
+    // Field 14, 15: utime, stime (index 11, 12 in parts)
+    uint64_t utime = 0, stime = 0;
+    try { utime = std::stoull(parts[11]); } catch (...) {}
+    try { stime = std::stoull(parts[12]); } catch (...) {}
+
+    // Field 22: starttime (index 19 in parts)
+    uint64_t starttime = 0;
+    try { starttime = std::stoull(parts[19]); } catch (...) {}
+
+    // Field 24: rss in pages (index 21 in parts)
+    uint64_t rss_pages = 0;
+    try { rss_pages = std::stoull(parts[21]); } catch (...) {}
 
     out_snap.utime = utime;
     out_snap.stime = stime;
 
     p.ppid  = ppid;
     p.state = static_cast<ProcState>(state_c);
-    p.rss_kb = rss * 4; // pages -> KB (assume 4K pages)
+    p.rss_kb = rss_pages * 4; // 1 page = 4 KB
 
     // CPU% (top-style per-core normalization: 100% means 1 full core utilized)
     if (prev && cpu_delta > 0) {
