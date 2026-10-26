@@ -15,7 +15,7 @@
 
 namespace ui {
 
-enum class Panel { PROCESSES, NETWORK, AUTH, EVENTS, INCIDENTS, HELP };
+enum class Panel { PROCESSES, NETWORK, AUTH, EVENTS, HELP };
 
 enum class EventFilter { ALL, AUTH, PROCESS, NETWORK, FILE, SYSTEM };
 
@@ -43,10 +43,6 @@ struct UiState {
 
     int         auth_selected    = 0;
     int         auth_scroll      = 0;
-
-    int         inc_selected     = 0;
-    int         inc_scroll       = 0;
-    bool        inc_detail       = false;
 
     int         help_scroll      = 0;
 
@@ -98,9 +94,6 @@ private:
     void draw_events(const DisplayData& d, const UiState& state,
                      int top_row, int rows, int cols);
     void draw_event_detail(const events::Event& e, int rows, int cols);
-    void draw_incidents(const DisplayData& d, const UiState& state,
-                        int top_row, int rows, int cols);
-    void draw_incident_detail(const incidents::Incident& inc, int rows, int cols);
     void draw_help(const UiState& state, int top_row, int rows, int cols);
     void draw_footer(const UiState& state, int cols);
     void draw_confirm(const UiState& state, int cols);

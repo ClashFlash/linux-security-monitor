@@ -221,15 +221,14 @@ bool Terminal::handle_key(UiState& state, int key, DisplayData& data)
         if (key == 'q' || key == 'Q') { state.quit = true; return false; }
         if (key == KEY_TAB || key == '\t') {
             state.active_panel = static_cast<Panel>(
-                (static_cast<int>(state.active_panel) + 1) % 6);
+                (static_cast<int>(state.active_panel) + 1) % 5);
             return true;
         }
         if (key == '1') { state.active_panel = Panel::PROCESSES; return true; }
         if (key == '2') { state.active_panel = Panel::NETWORK;   return true; }
         if (key == '3') { state.active_panel = Panel::AUTH;      return true; }
         if (key == '4') { state.active_panel = Panel::EVENTS;    return true; }
-        if (key == '5') { state.active_panel = Panel::INCIDENTS; return true; }
-        if (key == '6' || key == 'h' || key == 'H') { state.active_panel = Panel::HELP; return true; }
+        if (key == '5' || key == 'h' || key == 'H') { state.active_panel = Panel::HELP; return true; }
         if (key == 'B') {
             state.confirm = ConfirmAction::REBASE;
             return true;
@@ -332,42 +331,6 @@ bool Terminal::handle_key(UiState& state, int key, DisplayData& data)
         if (key == KEY_DOWN || key == 'j' || key == 'J') state.auth_selected++;
     }
 
-    if (state.active_panel == Panel::INCIDENTS && data.incidents) {
-        auto list = data.incidents->snapshot();
-        if (state.inc_detail) {
-            if (key == KEY_ESC) { state.inc_detail = false; return true; }
-        }
-        if ((key == KEY_UP || key == 'k' || key == 'K') && state.inc_selected > 0)
-            state.inc_selected--;
-        if ((key == KEY_DOWN || key == 'j' || key == 'J') &&
-            state.inc_selected + 1 < static_cast<int>(list.size()))
-            state.inc_selected++;
-        if (key == KEY_ENTER && !list.empty()) state.inc_detail = true;
-        if (!list.empty() && state.inc_selected < static_cast<int>(list.size())) {
-            const auto& id = list[state.inc_selected].id;
-            if (key == 'a' || key == 'A')
-                data.incidents->set_status(id, incidents::Status::ACKNOWLEDGED);
-            if (key == 'i' || key == 'I')
-                data.incidents->set_status(id, incidents::Status::INVESTIGATING);
-            if (key == 'r' || key == 'R')
-                data.incidents->set_status(id, incidents::Status::RESOLVED);
-            if (key == 'e' || key == 'E') {
-                auto path = data.incidents->export_report(id, data.reports_dir);
-                state.status_message = path.empty() ? "Export failed"
-                                                    : "Exported " + path.string();
-            }
-            if (key == 'x' || key == 'X') {
-                int pid = list[state.inc_selected].related_pid;
-                if (pid > 0) {
-                    state.confirm = ConfirmAction::KILL_PROCESS;
-                    state.confirm_pid = pid;
-                } else {
-                    state.status_message = "No related PID to terminate";
-                }
-            }
-        }
-    }
-
     if (state.active_panel == Panel::HELP) {
         if ((key == KEY_UP || key == 'k' || key == 'K') && state.help_scroll > 0) state.help_scroll--;
         if (key == KEY_DOWN || key == 'j' || key == 'J') state.help_scroll++;
@@ -408,9 +371,6 @@ void Terminal::draw(const DisplayData& d, const UiState& state) {
             break;
         case Panel::EVENTS:
             draw_events(d, state, top_row, body_rows, cols);
-            break;
-        case Panel::INCIDENTS:
-            draw_incidents(d, state, top_row, body_rows, cols);
             break;
         case Panel::HELP:
             draw_help(state, top_row, body_rows, cols);
@@ -489,8 +449,7 @@ void Terminal::draw_tab_bar(const UiState& state, int cols) {
         {Panel::NETWORK,   " [2] Network   "},
         {Panel::AUTH,      " [3] Auth      "},
         {Panel::EVENTS,    " [4] Events    "},
-        {Panel::INCIDENTS, " [5] Incidents "},
-        {Panel::HELP,      " [6] Help      "},
+        {Panel::HELP,      " [5] Help      "},
     };
     for (const auto& t : tabs) {
         if (t.p == state.active_panel)
@@ -905,140 +864,6 @@ void Terminal::draw_event_detail(const events::Event& e, int rows, int cols)
     printf("%s", ANSI_CLEAR_DOWN);
 }
 
-// ─── Incidents panel ──────────────────────────────────────────────────────
-
-void Terminal::draw_incidents(const DisplayData& d, const UiState& state,
-                               int top_row, int rows, int cols)
-{
-    if (!d.incidents) {
-        set_cursor(top_row, 1);
-        printf(ANSI_DIM " Incident store not available.%s\n" ANSI_RESET, ANSI_CLEAR_LINE);
-        return;
-    }
-    auto list = d.incidents->snapshot();
-
-    if (state.inc_detail && !list.empty() &&
-        state.inc_selected < static_cast<int>(list.size())) {
-        draw_incident_detail(list[state.inc_selected], rows, cols);
-        return;
-    }
-
-    set_cursor(top_row, 1);
-    printf(ANSI_BOLD ANSI_BCYAN " ── Incidents (%zu total, %zu open) ─────" ANSI_RESET "%s\n",
-           list.size(), d.incidents->count_open(), ANSI_CLEAR_LINE);
-    printf(ANSI_BOLD "%-10s %-11s %-9s %-9s %-20s %-20s" ANSI_RESET "%s\n",
-           "ID", "STATUS", "SEV", "CAT", "FIRST SEEN", "TITLE", ANSI_CLEAR_LINE);
-
-    int visible = std::max(0, rows - 3);
-    int skip    = state.inc_scroll;
-    int drawn   = 0;
-
-    for (int i = 0; i < static_cast<int>(list.size()) && drawn < visible; ++i) {
-        if (skip-- > 0) continue;
-        const auto& inc = list[i];
-        bool selected   = i == state.inc_selected;
-
-        // Store in local variables — severity_color() returns a temporary std::string,
-        // so calling .c_str() inline produces a dangling pointer and stray characters.
-        std::string sev_col_str = severity_color(inc.max_severity);
-        const char* sev_col = sev_col_str.c_str();
-        const char* stat_col =
-            inc.status == incidents::Status::OPEN           ? ANSI_BRED :
-            inc.status == incidents::Status::ACKNOWLEDGED   ? ANSI_BYELLOW :
-            inc.status == incidents::Status::INVESTIGATING  ? ANSI_BCYAN :
-            inc.status == incidents::Status::RESOLVED       ? ANSI_GREEN : ANSI_RESET;
-
-        auto ts = std::chrono::system_clock::to_time_t(inc.first_seen);
-        char tsbuf[20] = {};
-        struct tm tm_info{};
-        if (localtime_r(&ts, &tm_info)) strftime(tsbuf, sizeof(tsbuf), "%m/%d %H:%M", &tm_info);
-
-        int title_w = std::max(10, cols - 73);
-        set_cursor(top_row + 2 + drawn, 1);
-        if (selected) {
-            printf(ANSI_SEL_BG "%-10s %-11s %-9s %-9s %-20s %-*s" ANSI_RESET "%s\n",
-                   trunc(inc.id, 10).c_str(),
-                   trunc(inc.status_str(), 11).c_str(),
-                   trunc(events::severity_to_str(inc.max_severity), 9).c_str(),
-                   trunc(events::category_to_str(inc.category), 9).c_str(),
-                   tsbuf,
-                   title_w, trunc(inc.title, title_w).c_str(), ANSI_CLEAR_LINE);
-        } else {
-            printf("%-10s %s%-11s" ANSI_RESET " %s%-9s" ANSI_RESET
-                   " %-9s %-20s %-*s%s\n",
-                   trunc(inc.id, 10).c_str(),
-                   stat_col, trunc(inc.status_str(), 11).c_str(),
-                   sev_col, trunc(events::severity_to_str(inc.max_severity), 9).c_str(),
-                   trunc(events::category_to_str(inc.category), 9).c_str(),
-                   tsbuf,
-                   title_w, trunc(inc.title, title_w).c_str(), ANSI_CLEAR_LINE);
-        }
-        drawn++;
-    }
-    for (int i = drawn; i < visible; ++i) {
-        set_cursor(top_row + 2 + i, 1);
-        printf("%s\n", ANSI_CLEAR_LINE);
-    }
-}
-
-void Terminal::draw_incident_detail(const incidents::Incident& inc, int rows, int cols)
-{
-    set_cursor(5, 1);
-    printf(ANSI_BOLD ANSI_BCYAN " ── Incident Detail ─────────────────────" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
-    auto lbl = [&](const char* l, const std::string& val) {
-        int vw = std::max(10, cols - 20);
-        printf(ANSI_BOLD " %-16s" ANSI_RESET " %s%s\n", l, trunc(val, vw).c_str(), ANSI_CLEAR_LINE);
-    };
-    lbl("Incident ID:",  inc.id);
-    lbl("Status:",       inc.status_str());
-    lbl("Severity:",     events::severity_to_str(inc.max_severity));
-    lbl("Category:",     events::category_to_str(inc.category));
-    lbl("First seen:",   events::format_time(inc.first_seen));
-    lbl("Last seen:",    events::format_time(inc.last_seen));
-    lbl("Title:",        inc.title);
-    if (inc.related_pid > 0) lbl("Related PID:", std::to_string(inc.related_pid));
-    if (!inc.related_user.empty())  lbl("User:",  inc.related_user);
-    if (!inc.related_path.empty())  lbl("Path:",  inc.related_path);
-    if (!inc.extra.empty())         lbl("Key:",   inc.extra);
-
-    int ev_count = static_cast<int>(inc.evidence_events.size());
-    lbl("Evidence events:", std::to_string(ev_count));
-
-    if (!inc.explanation.empty()) {
-        printf(ANSI_BOLD ANSI_BYELLOW "\n Why suspicious:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
-        printf("   %s%s\n", trunc(inc.explanation, cols - 4).c_str(), ANSI_CLEAR_LINE);
-    }
-    if (!inc.next_steps.empty()) {
-        printf(ANSI_BOLD ANSI_BCYAN "\n What to check next:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
-        printf("   %s%s\n", trunc(inc.next_steps, cols - 4).c_str(), ANSI_CLEAR_LINE);
-    }
-
-    // Show up to 5 most recent evidence events
-    int show_ev = std::min(ev_count, 5);
-    if (show_ev > 0) {
-        printf(ANSI_BOLD "\n Recent evidence:" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
-        for (int i = ev_count - show_ev; i < ev_count; ++i) {
-            const auto& e = inc.evidence_events[i];
-            // Store severity color in a local — temporary std::string::c_str() is dangling.
-            std::string ev_col_str = severity_color(e.severity);
-            printf("  %s[%s] %s %s%s" ANSI_RESET " %s%s\n",
-                   ev_col_str.c_str(),
-                   e.timestamp_str().c_str(),
-                   e.severity_str().c_str(),
-                   e.category_str().c_str(),
-                   ANSI_RESET,
-                   trunc(e.title, cols - 40).c_str(),
-                   ANSI_CLEAR_LINE);
-        }
-    }
-
-    // Status actions and available keys
-    printf(ANSI_DIM "\n ESC:Back  a:Acknowledge  i:Investigating  r:Resolve  e:Export  x:Kill PID" ANSI_RESET "%s\n",
-           ANSI_CLEAR_LINE);
-    printf("%s", ANSI_CLEAR_DOWN);
-    (void)rows;
-}
-
 void Terminal::draw_events(const DisplayData& d, const UiState& state,
                             int top_row, int rows, int cols)
 {
@@ -1141,9 +966,9 @@ void Terminal::draw_help(const UiState& state, int top_row, int rows, int cols) 
 
     const char* guide[] = {
         ANSI_BOLD ANSI_BYELLOW "[1] GLOBAL CONTROLS & SHORTCUTS" ANSI_RESET,
-        "  TAB / 1-5    Switch active panel (1:Processes, 2:Network, 3:Events, 4:Incidents, 5:Help)",
+        "  TAB / 1-5    Switch active panel (1:Processes, 2:Network, 3:Auth, 4:Events, 5:Help)",
         "  q / Q        Gracefully terminate and restore terminal",
-        "  h / 4        Open this reference guide",
+        "  h / 5        Open this reference guide",
         "  ↑ ↓ / j k    Navigate or scroll active tables and event lists",
         "  Home / End   Jump directly to top or bottom of table",
         "  PgUp / PgDn  Scroll 10 lines up or down",
@@ -1208,51 +1033,19 @@ void Terminal::draw_help(const UiState& state, int top_row, int rows, int cols) 
         "  Severity Levels:",
         "    " ANSI_BGREEN "LOW" ANSI_RESET " / " ANSI_BYELLOW "MEDIUM" ANSI_RESET " / " ANSI_RED "HIGH" ANSI_RESET " / " ANSI_BRED "CRITICAL" ANSI_RESET " (Emits desktop alert & terminal bell)",
         "",
-        ANSI_BOLD ANSI_BYELLOW "[5] INCIDENTS PANEL (key 5)" ANSI_RESET,
-        "  Overview List Keys:",
-        "    ↑ ↓ / j k    Navigate the incident list",
-        "    Enter        Open incident detail view",
-        "    a            Acknowledge the selected incident (mark seen)",
-        "    i            Set status to Investigating",
-        "    r            Mark incident Resolved",
-        "    e            Export full incident report to disk (reports/ directory)",
-        "    x            Send SIGTERM to the incident's related PID (confirmation required)",
-        "    ESC          Return from detail view to the incident list",
-        "",
-        "  Incident Lifecycle:",
-        "    OPEN → ACKNOWLEDGED → INVESTIGATING → RESOLVED",
-        "    Each status change is persisted to disk and survives restarts.",
-        "    Resolved incidents remain in the list for audit purposes.",
-        "",
-        ANSI_BOLD ANSI_BYELLOW "[6] BURST DETECTION (NETWORK ANOMALY)" ANSI_RESET,
+        ANSI_BOLD ANSI_BYELLOW "[5] BURST DETECTION (NETWORK ANOMALY)" ANSI_RESET,
         "  Burst detection watches for sudden spikes in connection activity:",
         "    • A burst is triggered when a process opens more connections than the",
         "      configured threshold within a single monitoring interval.",
-        "    • Bursts are emitted as NETWORK/HIGH events and automatically create",
-        "      or update an Incident grouped by the owning process's PID.",
+        "    • Bursts are emitted as NETWORK/HIGH events and logged to the Events panel.",
         "    • Trusted ports (marked with 't' on the Network panel) are excluded.",
         "",
         "  Investigating a burst:",
-        "    1. Check the Incidents panel (key 5) for grouped burst alerts.",
-        "    2. Open the incident detail to see first/last seen, related PID, path.",
-        "    3. Use the Events panel (key 3) and filter by NET to see per-event detail.",
-        "    4. If the process is expected (e.g. a backup tool), mark the incident Resolved.",
+        "    1. Go to the Events panel (key 4) and filter by NET to see burst events.",
+        "    2. Note the related PID, path, and remote addresses in the event detail.",
+        "    3. If the process is expected (e.g. a backup tool), no action needed.",
         "",
-        ANSI_BOLD ANSI_BYELLOW "[7] INCIDENT INGESTION (EVENT → INCIDENT PIPELINE)" ANSI_RESET,
-        "  Every security event is evaluated against the IncidentStore for grouping:",
-        "    • Events sharing a group key (PID, source IP, file path, or port) are",
-        "      merged into a single Incident rather than flooding the list.",
-        "    • The incident's severity is promoted if a new event is more severe.",
-        "    • Incidents persist across restarts in ~/.local/share/linux-security-monitor/",
-        "",
-        "  Group keys by category:",
-        "    AUTH     Grouped by source IP address",
-        "    PROCESS  Grouped by PID (or executable path for ephemeral processes)",
-        "    NETWORK  Grouped by port number (listening) or remote IP (outbound)",
-        "    FILE     Grouped by absolute file path",
-        "    SYSTEM   Grouped by event title",
-        "",
-        ANSI_BOLD ANSI_BYELLOW "[8] PROCESS PARENT-CHAIN ANALYSIS" ANSI_RESET,
+        ANSI_BOLD ANSI_BYELLOW "[6] PROCESS PARENT-CHAIN ANALYSIS" ANSI_RESET,
         "  The security engine walks the process tree to detect anomalous spawn chains:",
         "    • A service process (nginx, sshd, httpd, etc.) that spawns an interactive",
         "      shell (bash, sh, zsh, python, perl, ruby) triggers a HIGH alert.",
@@ -1320,19 +1113,16 @@ void Terminal::draw_footer(const UiState& state, int cols) {
             footer = " q:Quit  TAB:Next  ↑↓/jk:Nav  c:CPU  m:MEM  p:PID  /:Search  Enter:Detail  x:Kill  B:Rebaseline";
             break;
         case Panel::NETWORK:
-            footer = " q:Quit  TAB:Next  ↑↓:Scroll  t:Trust/Untrust  l:Timeline  1-6:Panels";
+            footer = " q:Quit  TAB:Next  ↑↓:Scroll  t:Trust/Untrust  l:Timeline  1-5:Panels";
             break;
         case Panel::AUTH:
-            footer = " q:Quit  TAB:Next  ↑↓/jk:Nav  1-6:Panels";
+            footer = " q:Quit  TAB:Next  ↑↓/jk:Nav  1-5:Panels";
             break;
         case Panel::EVENTS:
-            footer = " q:Quit  TAB:Next  f:Filter  /:Search  ↑↓:Nav  Enter:Detail  ESC:Back  1-6:Panels";
-            break;
-        case Panel::INCIDENTS:
-            footer = " q:Quit  TAB:Next  ↑↓:Nav  Enter:Detail  a:Ack  i:Invest  r:Resolve  e:Export  x:Kill PID";
+            footer = " q:Quit  TAB:Next  f:Filter  /:Search  ↑↓:Nav  Enter:Detail  ESC:Back  1-5:Panels";
             break;
         case Panel::HELP:
-            footer = " q:Quit  TAB:Next  ↑↓/jk/PgUp/PgDn:Scroll  1-6:Panels";
+            footer = " q:Quit  TAB:Next  ↑↓/jk/PgUp/PgDn:Scroll  1-5:Panels";
             break;
     }
     if (!state.status_message.empty()) {
