@@ -36,6 +36,9 @@ struct UiState {
     // Network panel
     int         net_scroll       = 0;
 
+    // Help panel
+    int         help_scroll      = 0;
+
     bool        quit             = false;
 };
 
@@ -77,7 +80,7 @@ private:
                       int top_row, int rows, int cols);
     void draw_events(const DisplayData& d, const UiState& state,
                      int top_row, int rows, int cols);
-    void draw_help(int rows, int cols);
+    void draw_help(const UiState& state, int top_row, int rows, int cols);
     void draw_footer(const UiState& state, int cols);
 
     // ASCII progress bar: e.g. [████░░░░] 42%

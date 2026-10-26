@@ -240,6 +240,14 @@ bool Terminal::handle_key(UiState& state, int key,
         if (key == KEY_DOWN || key == 'j' || key == 'J') state.net_scroll++;
     }
 
+    if (state.active_panel == Panel::HELP) {
+        if ((key == KEY_UP || key == 'k' || key == 'K') && state.help_scroll > 0) state.help_scroll--;
+        if (key == KEY_DOWN || key == 'j' || key == 'J') state.help_scroll++;
+        if (key == KEY_PGUP) state.help_scroll = std::max(0, state.help_scroll - 10);
+        if (key == KEY_PGDN) state.help_scroll += 10;
+        if (key == 1006) state.help_scroll = 0; // Home
+    }
+
     return true;
 }
 
@@ -271,7 +279,7 @@ void Terminal::draw(const DisplayData& d, const UiState& state) {
             draw_events(d, state, top_row, body_rows, cols);
             break;
         case Panel::HELP:
-            draw_help(rows, cols);
+            draw_help(state, top_row, body_rows, cols);
             break;
     }
 
@@ -622,39 +630,100 @@ void Terminal::draw_events(const DisplayData& d, const UiState& state,
     }
 }
 
-void Terminal::draw_help(int rows, int cols) {
-    (void)rows; (void)cols;
-    set_cursor(5, 1);
-    printf(ANSI_BOLD ANSI_BCYAN " ── Keyboard Reference ──────────────────\n\n" ANSI_RESET);
-    const char* help[] = {
-        "  TAB / 1-4    Switch panel",
-        "  q            Quit",
-        "  h / 4        Show this help",
+void Terminal::draw_help(const UiState& state, int top_row, int rows, int cols) {
+    (void)cols;
+    set_cursor(top_row, 1);
+    printf(ANSI_BOLD ANSI_BCYAN " ── Linux Security Monitor Guide & Reference ────────────────────────" ANSI_RESET "%s\n", ANSI_CLEAR_LINE);
+
+    const char* guide[] = {
+        ANSI_BOLD ANSI_BYELLOW "[1] GLOBAL CONTROLS & SHORTCUTS" ANSI_RESET,
+        "  TAB / 1-4    Switch active panel (1:Processes, 2:Network, 3:Events, 4:Help)",
+        "  q / Q        Gracefully terminate and restore terminal",
+        "  h / 4        Open this reference guide",
+        "  ↑ ↓ / j k    Navigate or scroll active tables and event lists",
+        "  Home / End   Jump directly to top or bottom of table",
+        "  PgUp / PgDn  Scroll 10 lines up or down",
         "",
-        "  PROCESSES:",
-        "    ↑ ↓ / j k  Navigate process list",
-        "    Home / End Jump to top / bottom",
-        "    PgUp / PgDn Jump 10 rows",
-        "    Enter       Process detail screen",
-        "    ESC         Back from detail",
-        "    c           Sort by CPU%",
-        "    m           Sort by MEM%",
-        "    p           Sort by PID",
-        "    /           Search / filter by name",
+        ANSI_BOLD ANSI_BYELLOW "[2] PROCESSES PANEL (TAB 1)" ANSI_RESET,
+        "  Interactive Keys:",
+        "    c / m / p    Sort processes by CPU%, Memory usage, or PID",
+        "    /            Search/filter processes live by process name or cmdline",
+        "    Enter        Open full process detail screen with file descriptors",
+        "    ESC          Exit search mode or return from detail view",
         "",
-        "  EVENTS:",
-        "    ↑ ↓ / j k   Scroll events",
-        "    PgUp / PgDn Page up / down",
-        "    f           Cycle filter (All/Auth/Proc/Net/File/Sys)",
-        "    /           Search event titles & details",
+        "  Table Columns & Field Meanings:",
+        "    PID          Process Identifier (unique integer assigned by kernel)",
+        "    PPID         Parent Process ID (the process that spawned this process)",
+        "    USER         Username (or UID) that owns and executes this process",
+        "    CPU%         Active CPU utilization normalized across all CPU cores",
+        "                 (100% means 1 full core utilized, matching top/htop)",
+        "    MEM          Resident Physical Memory (RSS) in RAM in compact K/M/G units",
+        "                 (e.g., 512K = Kilobytes, 45M = Megabytes, 1.4G = Gigabytes)",
+        "    S (State)    Process Execution State from /proc/[pid]/stat:",
+        "                 • " ANSI_BGREEN "R (Running)" ANSI_RESET "   : Actively executing on CPU or in run queue ready to run",
+        "                 • " ANSI_BYELLOW "S (Sleeping)" ANSI_RESET "  : Waiting for an event/resource (I/O, timer, input)",
+        "                 • " ANSI_BRED "D (Disk Sleep)" ANSI_RESET ": Uninterruptible disk or driver I/O sleep",
+        "                 • " ANSI_BRED "Z (Zombie)" ANSI_RESET "    : Terminated process waiting for parent to read exit code",
+        "                 • " ANSI_DIM "T (Stopped)" ANSI_RESET "   : Suspended by SIGSTOP or debugger",
+        "    COMMAND      Short comm/binary executable name (e.g. systemd, bash, sshd)",
+        "    EXE PATH     Absolute path to binary on disk resolved via /proc/[pid]/exe",
+        "    STARTED      Date and local time the process was spawned",
         "",
-        "  NETWORK:",
-        "    ↑ ↓ / j k   Scroll connection list",
+        "  Security Threat Row Highlights:",
+        "    • " ANSI_SEL_BG " Blue Highlight " ANSI_RESET "         : Currently selected row (press Enter for details)",
+        "    • " ANSI_BRED "Bright Red Text" ANSI_RESET "         : Critical Anomaly: Root process (UID 0) running",
+        "                                  from suspicious directory (/tmp, /dev/shm)",
+        "    • " ANSI_BYELLOW "Bright Yellow Text" ANSI_RESET "      : Suspicious Anomaly: Running from temp folder or",
+        "                                  binary deleted from disk while in memory",
+        "",
+        ANSI_BOLD ANSI_BYELLOW "[3] NETWORK MONITOR PANEL (TAB 2)" ANSI_RESET,
+        "  Interfaces Table:",
+        "    RX/s, TX/s   Live network throughput rate (bytes/s, KB/s, or MB/s)",
+        "    RX/TX bytes  Cumulative transfer volume since interface came up",
+        "    RX/TX err    Packet receive/transmit errors detected by kernel",
+        "",
+        "  Connections Table:",
+        "    PROTO        Protocol family: TCP, TCP6, UDP, UDP6",
+        "    LOCAL        Local IP address and listening/binding port number",
+        "    REMOTE       Remote peer address and connection port",
+        "    STATE        Socket status (ESTABLISHED = Connected, LISTEN = Open port)",
+        "    PID/PROCESS  Owning Process ID and command name that holds the open socket",
+        "",
+        ANSI_BOLD ANSI_BYELLOW "[4] SECURITY EVENTS PANEL (TAB 3)" ANSI_RESET,
+        "  Event Feed & Filter:",
+        "    f            Cycle category filter: ALL → AUTH → PROC → NET → FILE → SYS",
+        "    /            Live search across event titles and detail explanations",
+        "",
+        "  Event Categories:",
+        "    AUTH         SSH logins: successful logins, password failures, brute-force",
+        "    PROCESS      Threat heuristics: temp path execution, deleted binaries",
+        "    NETWORK      New listening ports opened, closed connections",
+        "    FILE         File Integrity Monitor: changes to watched config/system files",
+        "    SYSTEM       Core system events and engine notifications",
+        "",
+        "  Severity Levels:",
+        "    " ANSI_BGREEN "LOW" ANSI_RESET " / " ANSI_BYELLOW "MEDIUM" ANSI_RESET " / " ANSI_RED "HIGH" ANSI_RESET " / " ANSI_BRED "CRITICAL" ANSI_RESET " (Emits desktop alert & terminal bell)",
         nullptr
     };
-    for (int i = 0; help[i]; i++)
-        printf("%s%s\n", help[i], ANSI_CLEAR_LINE);
-    printf("%s", ANSI_CLEAR_DOWN);
+
+    int total_lines = 0;
+    while (guide[total_lines] != nullptr) total_lines++;
+
+    int visible = std::max(0, rows - 1);
+    int scroll = state.help_scroll;
+    if (scroll > total_lines - visible) scroll = std::max(0, total_lines - visible);
+
+    int drawn = 0;
+    for (int i = 0; i < visible && (i + scroll) < total_lines; ++i) {
+        set_cursor(top_row + 1 + i, 1);
+        printf(" %s%s\n", guide[i + scroll], ANSI_CLEAR_LINE);
+        drawn++;
+    }
+
+    for (int i = drawn; i < visible; ++i) {
+        set_cursor(top_row + 1 + i, 1);
+        printf("%s\n", ANSI_CLEAR_LINE);
+    }
 }
 
 void Terminal::draw_footer(const UiState& state, int cols) {
@@ -675,7 +744,7 @@ void Terminal::draw_footer(const UiState& state, int cols) {
             footer = " q:Quit  TAB:Switch  f:Filter  /:Search  ↑↓PgUp PgDn:Scroll  1-4:Panels";
             break;
         case Panel::HELP:
-            footer = " q:Quit  TAB:Switch  1-4:Panels";
+            footer = " q:Quit  TAB:Switch  ↑↓/jk/PgUp/PgDn:Scroll Help  1-4:Panels";
             break;
     }
     footer += std::string(std::max(0, cols - static_cast<int>(footer.size())), ' ');
